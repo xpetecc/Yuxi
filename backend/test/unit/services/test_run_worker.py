@@ -115,9 +115,17 @@ async def test_validate_run_workdir_binding_requires_subagent_creator_tree(
 
     async def fake_resolve(**kwargs):
         if kwargs["thread_id"] == "child-thread":
-            return SimpleNamespace(conversation_id=run.conversation_id, workdir_path="projects/shared")
+            return SimpleNamespace(
+                conversation_id=run.conversation_id,
+                workdir_path="projects/shared",
+                project_id="project-1",
+            )
         assert kwargs["thread_id"] == "root-thread"
-        return SimpleNamespace(conversation_id=creator.conversation_id, workdir_path="projects/shared")
+        return SimpleNamespace(
+            conversation_id=creator.conversation_id,
+            workdir_path="projects/shared",
+            project_id="project-1",
+        )
 
     class RunRepo:
         def __init__(self, _db):
@@ -138,6 +146,19 @@ async def test_validate_run_workdir_binding_requires_subagent_creator_tree(
     binding = await run_worker._validate_run_workdir_binding(run)
     assert binding.conversation_id == run.conversation_id
 
+    original_resolve = fake_resolve
+
+    async def resolve_different_project(**kwargs):
+        binding = await original_resolve(**kwargs)
+        if kwargs["thread_id"] == "child-thread":
+            binding.project_id = "project-2"
+        return binding
+
+    monkeypatch.setattr(run_worker, "resolve_authorized_workdir", resolve_different_project)
+    with pytest.raises(run_worker.NonRetryableRunError, match="SubAgent Run"):
+        await run_worker._validate_run_workdir_binding(run)
+
+    monkeypatch.setattr(run_worker, "resolve_authorized_workdir", fake_resolve)
     creator.runtime_scope_id = "corrupted-root"
     with pytest.raises(run_worker.NonRetryableRunError, match="SubAgent Run"):
         await run_worker._validate_run_workdir_binding(run)
@@ -1384,3 +1405,11 @@ async def test_manifest_persist_failure_fails_run_before_execution(monkeypatch: 
     assert terminal_calls[0]["status"] == "failed"
     assert terminal_calls[0]["error_type"] == "manifest_persist_failed"
     assert "执行未开始" in terminal_calls[0]["error_message"]
+
+
+def test_retry_requires_new_manifest_fingerprint_to_match_write_once_fact():
+    persisted = SimpleNamespace(manifest_fingerprint="a" * 64)
+
+    run_worker._require_persisted_manifest_match(persisted, recorded=False, fingerprint="a" * 64)
+    with pytest.raises(RuntimeError, match="运行资产已在重试前变化"):
+        run_worker._require_persisted_manifest_match(persisted, recorded=False, fingerprint="b" * 64)

@@ -7,7 +7,7 @@ import {
   ClipboardList,
   LibraryBig,
   Box,
-  FolderKanban,
+  HardDrive,
   PanelLeft,
   PanelLeftOpen,
   MessageCirclePlus,
@@ -43,7 +43,7 @@ const taskerStore = useTaskerStore()
 const userStore = useUserStore()
 const { activeCount: activeCountRef, isDrawerOpen } = storeToRefs(taskerStore)
 const { knowledgeEnabled } = storeToRefs(runtimeCapabilitiesStore)
-const { threads, currentThreadId, hasMoreThreads, isLoadingMoreThreads } =
+const { threads, currentThreadId, hasMoreThreads, isLoadingMoreThreads, threadCreationInFlight } =
   storeToRefs(chatThreadsStore)
 
 // Add state for GitHub stars
@@ -173,10 +173,10 @@ const mainList = computed(() => {
   })
 
   items.push({
-    name: '工作区',
+    name: '个人空间',
     path: '/workspace',
-    icon: FolderKanban,
-    activeIcon: FolderKanban
+    icon: HardDrive,
+    activeIcon: HardDrive
   })
 
   items.push({
@@ -235,7 +235,7 @@ const initAgentNavigation = async () => {
 
 const handleSelectChat = (threadId) => {
   if (!threadId) return
-  chatThreadsStore.setCurrentThreadId(threadId)
+  if (!chatThreadsStore.setCurrentThreadId(threadId)) return
   router.push({ name: 'AgentCompWithThreadId', params: { thread_id: threadId } })
 }
 
@@ -250,7 +250,7 @@ const handleSearchSelectThread = (thread) => {
 }
 
 const handleCreateConversationFromSearch = () => {
-  chatThreadsStore.setCurrentThreadId(null)
+  if (!chatThreadsStore.setCurrentThreadId(null)) return
   router.push({ name: 'AgentComp' })
 }
 
@@ -300,6 +300,7 @@ watch(
   () => [route.path, route.params.thread_id],
   () => {
     if (!route.path.startsWith('/agent')) return
+    if (threadCreationInFlight.value) return
     const threadId = typeof route.params.thread_id === 'string' ? route.params.thread_id : null
     chatThreadsStore.setCurrentThreadId(threadId)
   },
@@ -474,7 +475,7 @@ provide('settingsModal', {
       default-mode="conversation"
       :recent-threads="threads"
       :file-search="searchWorkspace"
-      file-placeholder="搜索工作区文件..."
+      file-placeholder="搜索个人空间文件..."
       @select-thread="handleSearchSelectThread"
       @create-thread="handleCreateConversationFromSearch"
       @thread-found="handleSearchThreadFound"
@@ -572,7 +573,7 @@ div.header,
     justify-content: flex-start;
     align-items: stretch;
     position: relative;
-    gap: 0;
+    gap: 2px;
   }
 
   .sidebar-conversations {
@@ -721,13 +722,6 @@ div.header,
       outline: none;
     }
 
-    &.active {
-      border-color: transparent;
-      background-color: color-mix(in srgb, var(--main-color) 6%, var(--gray-0));
-      font-weight: 600;
-      color: var(--main-color);
-    }
-
     &.primary-action {
       margin-bottom: 8px;
       border-color: var(--gray-150);
@@ -738,7 +732,7 @@ div.header,
       &:hover {
         border-color: var(--gray-200);
         background-color: var(--gray-0);
-        color: var(--main-color);
+        color: var(--gray-900);
         box-shadow: 0 3px 4px rgba(0, 10, 20, 0.07);
       }
     }
@@ -749,8 +743,15 @@ div.header,
 
     &:hover {
       border-color: transparent;
-      background-color: var(--main-20);
-      color: var(--main-color);
+      background-color: var(--gray-50);
+      color: var(--gray-900);
+    }
+
+    &.active {
+      border-color: transparent;
+      background-color: color-mix(in srgb, var(--gray-100) 6%, var(--gray-100));
+      font-weight: 600;
+      color: var(--gray-1000);
     }
 
     &.github {

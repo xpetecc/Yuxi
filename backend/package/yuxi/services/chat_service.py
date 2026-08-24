@@ -40,8 +40,10 @@ from yuxi.services.langfuse_service import (
     flush_langfuse,
     get_trace_info,
 )
+from yuxi.services.project_service import create_implicit_project
 from yuxi.services.run_queue_service import publish_cancel_signal
 from yuxi.services.subagent_run_service import serialize_subagent_run_state
+from yuxi.services.workdir_service import resolve_conversation_workdir_path
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import Agent, User
 from yuxi.utils.guard import content_guard
@@ -234,6 +236,22 @@ def _apply_subagent_runtime_context(input_context: dict, meta: dict | None) -> N
     input_context["parent_thread_id"] = parent_thread_id
     # 标记为子智能体运行，供下游逻辑判断
     input_context["is_subagent_runtime"] = True
+
+
+def _validate_subagent_attachment_root(*, root_conversation, conversation, uid: str) -> None:
+    """确保 SubAgent 只读取同一 Project 根 Conversation 的附件。"""
+    if (
+        root_conversation is None
+        or root_conversation.uid != uid
+        or root_conversation.project_id != conversation.project_id
+    ):
+        raise ValueError("子智能体根 Conversation 的 Project Workdir 不可用")
+
+
+def _runtime_agent_config(agent_config: dict | None, execution_snapshot: dict | None) -> dict:
+    """优先使用 manifest 同次解析的配置，再由调用方追加工作区上下文。"""
+    snapshot_context = execution_snapshot.get("normalized_context") if isinstance(execution_snapshot, dict) else None
+    return snapshot_context if isinstance(snapshot_context, dict) else dict(agent_config or {})
 
 
 def _stream_message_key(metadata: dict | None, namespace: list[str], thread_id: str | None) -> tuple[str, str]:
@@ -841,9 +859,7 @@ async def _resolve_agent_runtime(
             # Conversation.agent_id 是历史字段名，实际保存的是 Agent.slug。
             if requested_agent_slug and requested_agent_slug != conversation.agent_id:
                 raise ValueError("已有线程已绑定智能体，不能切换")
-            if not conversation.workdir_path:
-                raise ValueError("Conversation 缺少 Project Workdir")
-            ensure_bound_user_workdir(str(user.uid), conversation.workdir_path)
+            await resolve_conversation_workdir_path(conversation=conversation, uid=str(user.uid), db=db)
             resolved_agent_slug = conversation.agent_id
 
     if not resolved_agent_slug:
@@ -899,14 +915,20 @@ async def _ensure_thread_bound_agent(
     thread_id: str,
     uid: str,
     agent_item: Agent,
+    db,
 ) -> Any:
     if not conversation:
-        return await conv_repo.create_conversation(
+        project = await create_implicit_project(uid=uid, db=db)
+        conversation = await conv_repo.add_conversation(
             uid=uid,
             agent_id=agent_item.slug,
             thread_id=thread_id,
             metadata={"backend_id": agent_item.backend_id},
+            project_id=project.id,
         )
+        await db.commit()
+        ensure_bound_user_workdir(uid, project.workdir_path)
+        return conversation
 
     if conversation.agent_id != agent_item.slug:
         raise ValueError("已有线程已绑定智能体，不能切换")
@@ -922,6 +944,7 @@ async def stream_agent_chat(
     current_user,
     db,
     save_user_message: bool = True,
+    execution_snapshot: dict | None = None,
 ) -> AsyncIterator[bytes]:
     start_time = asyncio.get_event_loop().time()
 
@@ -998,27 +1021,30 @@ async def stream_agent_chat(
             thread_id=thread_id,
             uid=uid,
             agent_item=agent_item,
+            db=db,
         )
         input_context = await build_agent_input_context(
-            agent_config,
+            _runtime_agent_config(agent_config, execution_snapshot),
             thread_id=thread_id,
             uid=uid,
             run_id=meta.get("run_id"),
             request_id=meta.get("request_id"),
+            worker_id=meta.get("worker_id"),
         )
         _apply_model_override(input_context, meta)
         _apply_input_context_field(input_context, meta, "tool_approval_mode")
         runtime_scope_id = str(meta.get("runtime_scope_id") or thread_id)
-        if not conversation.workdir_path:
-            raise ValueError("Conversation 缺少 Project Workdir")
+        workdir_path = await resolve_conversation_workdir_path(conversation=conversation, uid=uid, db=db)
         input_context["runtime_scope_id"] = runtime_scope_id
-        input_context["workdir_relative_path"] = conversation.workdir_path
-        input_context["workdir_path"] = runtime_workdir_path(conversation.workdir_path)
+        input_context["workdir_relative_path"] = workdir_path
+        input_context["workdir_path"] = runtime_workdir_path(workdir_path)
         meta["runtime_scope_id"] = runtime_scope_id
-        meta["workdir_relative_path"] = conversation.workdir_path
+        meta["workdir_relative_path"] = workdir_path
         meta["workdir_path"] = input_context["workdir_path"]
         _apply_subagent_runtime_context(input_context, meta)
         context = _build_agent_context(agent, input_context)
+        if isinstance(execution_snapshot, dict):
+            setattr(context, "_skill_runtime_snapshot", execution_snapshot.get("skill_runtime_snapshot"))
         langfuse_run = _build_langfuse_run_context(
             current_user=current_user,
             thread_id=thread_id,
@@ -1033,12 +1059,11 @@ async def stream_agent_chat(
         attachment_conversation = conversation
         if meta.get("run_type") == "subagent":
             attachment_conversation = await conv_repo.get_conversation_by_thread_id(runtime_scope_id)
-            if (
-                attachment_conversation is None
-                or attachment_conversation.uid != uid
-                or attachment_conversation.workdir_path != conversation.workdir_path
-            ):
-                raise ValueError("子智能体根 Conversation 的 Project Workdir 不可用")
+            _validate_subagent_attachment_root(
+                root_conversation=attachment_conversation,
+                conversation=conversation,
+                uid=uid,
+            )
         thread_attachment_records = await conv_repo.get_attachments(attachment_conversation.id)
         request_attachment_records = [
             attachment for attachment in thread_attachment_records if attachment.get("request_id") == meta["request_id"]
@@ -1087,7 +1112,7 @@ async def stream_agent_chat(
         await _ensure_persistent_sandbox(
             runtime_scope_id=runtime_scope_id,
             uid=uid,
-            workdir_path=conversation.workdir_path,
+            workdir_path=workdir_path,
         )
 
         # 先构建 langgraph_config
@@ -1304,6 +1329,7 @@ async def stream_agent_resume(
     meta: dict,
     current_user,
     db,
+    execution_snapshot: dict | None = None,
 ) -> AsyncIterator[bytes]:
     start_time = asyncio.get_event_loop().time()
 
@@ -1342,29 +1368,31 @@ async def stream_agent_resume(
     meta["agent_slug"] = agent_item.slug
     meta["backend_id"] = agent_item.backend_id
     runtime_scope_id = str(meta.get("runtime_scope_id") or thread_id)
-    if not conversation.workdir_path:
-        raise ValueError("Conversation 缺少 Project Workdir")
+    workdir_path = await resolve_conversation_workdir_path(conversation=conversation, uid=uid, db=db)
     meta["runtime_scope_id"] = runtime_scope_id
-    meta["workdir_relative_path"] = conversation.workdir_path
-    meta["workdir_path"] = runtime_workdir_path(conversation.workdir_path)
+    meta["workdir_relative_path"] = workdir_path
+    meta["workdir_path"] = runtime_workdir_path(workdir_path)
     await _ensure_persistent_sandbox(
         runtime_scope_id=runtime_scope_id,
         uid=uid,
-        workdir_path=conversation.workdir_path,
+        workdir_path=workdir_path,
     )
     input_context = await build_agent_input_context(
-        agent_config or {},
+        _runtime_agent_config(agent_config, execution_snapshot),
         thread_id=thread_id,
         uid=uid,
         run_id=meta.get("run_id"),
         request_id=meta.get("request_id"),
+        worker_id=meta.get("worker_id"),
     )
     _apply_model_override(input_context, meta)
     _apply_input_context_field(input_context, meta, "tool_approval_mode")
     input_context["runtime_scope_id"] = runtime_scope_id
-    input_context["workdir_relative_path"] = conversation.workdir_path
+    input_context["workdir_relative_path"] = workdir_path
     input_context["workdir_path"] = meta["workdir_path"]
     context = _build_agent_context(agent, input_context)
+    if isinstance(execution_snapshot, dict):
+        setattr(context, "_skill_runtime_snapshot", execution_snapshot.get("skill_runtime_snapshot"))
     langfuse_run = _build_langfuse_run_context(
         current_user=current_user,
         thread_id=thread_id,
@@ -1600,19 +1628,22 @@ async def get_agent_state_view(
             tool_approval_mode = latest_run.input_payload.get("tool_approval_mode")
             if tool_approval_mode:
                 input_context["tool_approval_mode"] = tool_approval_mode
-        if not conversation.workdir_path:
-            raise ValueError("Conversation 缺少 Project Workdir")
+        workdir_path = await resolve_conversation_workdir_path(
+            conversation=conversation,
+            uid=current_uid,
+            db=db,
+        )
         runtime_scope_id = str(getattr(latest_run, "runtime_scope_id", None) or thread_id)
         input_context["runtime_scope_id"] = runtime_scope_id
-        input_context["workdir_relative_path"] = conversation.workdir_path
-        input_context["workdir_path"] = runtime_workdir_path(conversation.workdir_path)
+        input_context["workdir_relative_path"] = workdir_path
+        input_context["workdir_path"] = runtime_workdir_path(workdir_path)
         context = _build_agent_context(agent, input_context)
         state = await _read_checkpoint_state(agent, uid=current_uid, thread_id=thread_id, context=context)
         values = getattr(state, "values", {}) if state else {}
         response = {
             "agent_state": extract_agent_state(
                 values,
-                workdir_path=runtime_workdir_path(conversation.workdir_path),
+                workdir_path=runtime_workdir_path(workdir_path),
             )
         }
         interrupt_info = _extract_interrupt_info(state) if state else None

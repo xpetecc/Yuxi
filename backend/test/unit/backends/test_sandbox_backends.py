@@ -11,12 +11,12 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import yuxi.agents.backends.sandbox.backend as sandbox_backend_module
-from deepagents.backends.protocol import GlobResult, ReadResult
+from deepagents.backends import CompositeBackend
+from deepagents.backends.protocol import GlobResult, GrepResult, ReadResult
 from deepagents.backends.sandbox import MAX_BINARY_BYTES
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolRuntime
 from yuxi.agents.backends.composite import (
-    CustomCompositeBackend,
     create_agent_composite_backend,
     create_agent_filesystem_middleware,
     sync_agent_context_skills,
@@ -30,6 +30,30 @@ from yuxi.agents.backends.paths import workdir_runtime_paths
 WORKDIR_RELATIVE_PATH = "projects/11111111-1111-4111-8111-111111111111"
 WORKDIR_PATH = "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"
 VIRTUAL_PATH_LARGE_TOOL_RESULTS, VIRTUAL_PATH_CONVERSATION_HISTORY = workdir_runtime_paths(WORKDIR_PATH)
+
+
+class _OwnedAsyncHttpClient:
+    def __init__(self):
+        self.closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        self.closed = True
+
+
+def _install_async_file_client(monkeypatch, backend, file_client):
+    backend._provider = SimpleNamespace(get=lambda *_args, **_kwargs: SimpleNamespace(sandbox_url="http://sandbox"))
+    http_client = _OwnedAsyncHttpClient()
+    monkeypatch.setattr(sandbox_backend_module.httpx, "AsyncClient", lambda **_kwargs: http_client)
+
+    def build_async_client(_url, owning_http_client):
+        assert owning_http_client is http_client
+        return SimpleNamespace(file=file_client)
+
+    monkeypatch.setattr(backend, "_build_async_client", build_async_client)
+    return http_client
 
 
 def _runtime(
@@ -74,21 +98,21 @@ def _make_provider(client) -> ProvisionerSandboxProvider:
 def test_create_agent_composite_backend_uses_sandbox_filesystem(monkeypatch):
     monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
 
-    backend = create_agent_composite_backend(_runtime())
+    backend = create_agent_composite_backend(_runtime().context)
 
     assert isinstance(backend.default, ProvisionerSandboxBackend)
     assert backend.routes == {}
-    assert backend.artifacts_root == "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111"
+    assert backend.artifacts_root == f"{WORKDIR_PATH}/outputs"
 
 
 def test_create_agent_composite_backend_derives_virtual_workdir_from_relative_path(monkeypatch):
     monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
-    runtime = _runtime()
-    runtime.config["configurable"]["workdir_path"] = "/home/gem/user-data/projects/stale"
+    context = _runtime().context
+    context.workdir_path = "/home/gem/user-data/projects/stale"
 
-    backend = create_agent_composite_backend(runtime)
+    backend = create_agent_composite_backend(context)
 
-    assert backend.artifacts_root == WORKDIR_PATH
+    assert backend.artifacts_root == f"{WORKDIR_PATH}/outputs"
 
 
 def test_sandbox_provider_release_deletes_sandbox_and_clears_cache():
@@ -230,7 +254,7 @@ async def test_sync_agent_context_skills_projects_all_user_authorized_skills(mon
 
 def test_create_agent_composite_backend_requires_thread_id():
     with pytest.raises(ValueError, match="thread_id is required"):
-        create_agent_composite_backend(_runtime(thread_id=None))
+        create_agent_composite_backend(_runtime(thread_id=None).context)
 
 
 def test_create_agent_filesystem_middleware_uses_context_scope(monkeypatch):
@@ -243,10 +267,11 @@ def test_create_agent_filesystem_middleware_uses_context_scope(monkeypatch):
         uid="user-1",
     )
 
-    middleware = create_agent_filesystem_middleware(context=context)
-    backend = middleware.backend(None)
+    middleware = create_agent_filesystem_middleware(
+        backend=create_agent_composite_backend(context),
+    )
 
-    assert backend.default._thread_id == "parent-thread"
+    assert middleware.backend.default._thread_id == "parent-thread"
 
 
 def test_context_backend_construction_does_not_sync_skill_projection(monkeypatch, tmp_path) -> None:
@@ -266,18 +291,20 @@ def test_context_backend_construction_does_not_sync_skill_projection(monkeypatch
         uid="user-1",
     )
 
-    middleware = create_agent_filesystem_middleware(context=context)
-    middleware.backend(None)
-    middleware.backend(None)
+    create_agent_composite_backend(context)
+    create_agent_composite_backend(context)
 
     user_skill = skill_service.get_user_skills_root_dir("user-1") / "shared-skill"
     assert not user_skill.exists()
 
 
 def test_create_agent_filesystem_middleware_uses_outputs_for_internal_artifacts() -> None:
+    class _Backend:
+        pass
+
     middleware = create_agent_filesystem_middleware(
-        tool_token_limit_before_evict=500,
-        context=_runtime().context,
+        500,
+        backend=CompositeBackend(default=_Backend(), routes={}, artifacts_root=f"{WORKDIR_PATH}/outputs"),
     )
 
     assert middleware._tool_token_limit_before_evict == 500
@@ -287,39 +314,63 @@ def test_create_agent_filesystem_middleware_uses_outputs_for_internal_artifacts(
 
 def test_filesystem_middleware_evicts_large_non_read_file_tool_result() -> None:
     class _Backend:
-        artifacts_root = "/"
-
         def __init__(self):
             self.writes: list[tuple[str, str]] = []
 
         def write(self, path: str, content: str):
             self.writes.append((path, content))
-            return SimpleNamespace(error=None)
+            return SimpleNamespace(error=None, path=path)
 
     backend = _Backend()
     middleware = create_agent_filesystem_middleware(
-        tool_token_limit_before_evict=1,
-        context=_runtime().context,
+        1,
+        backend=CompositeBackend(default=backend, routes={}, artifacts_root=f"{WORKDIR_PATH}/outputs"),
     )
-    middleware.backend = backend
-    request = SimpleNamespace(tool_call={"name": "grep"}, runtime=SimpleNamespace())
+    request = SimpleNamespace(tool_call={"name": "query_kb"}, runtime=SimpleNamespace())
     content = "BEGIN\n" + ("middle\n" * 5000) + "END"
 
     result = middleware.wrap_tool_call(
         request,
-        lambda _: ToolMessage(content=content, name="grep", tool_call_id="call-grep"),
+        lambda _: ToolMessage(content=content, name="query_kb", tool_call_id="call-kb"),
     )
 
-    assert backend.writes == [(f"{VIRTUAL_PATH_LARGE_TOOL_RESULTS}/call-grep", content)]
+    assert backend.writes == [(f"{VIRTUAL_PATH_LARGE_TOOL_RESULTS}/call-kb", content)]
     assert isinstance(result, ToolMessage)
     assert len(result.content) < len(content)
-    assert f"{VIRTUAL_PATH_LARGE_TOOL_RESULTS}/call-grep" in result.content
+    assert f"{VIRTUAL_PATH_LARGE_TOOL_RESULTS}/call-kb" in result.content
+
+
+def test_filesystem_middleware_keeps_builtin_fs_tool_result_inline() -> None:
+    """0.7 上游语义：内建文件工具自带截断（分页/max_count），不再做结果 eviction。"""
+
+    class _Backend:
+        def __init__(self):
+            self.writes: list[tuple[str, str]] = []
+
+        def write(self, path: str, content: str):
+            self.writes.append((path, content))
+            return SimpleNamespace(error=None, path=path)
+
+    backend = _Backend()
+    middleware = create_agent_filesystem_middleware(
+        1,
+        backend=CompositeBackend(default=backend, routes={}, artifacts_root=f"{WORKDIR_PATH}/outputs"),
+    )
+    content = "BEGIN\n" + ("middle\n" * 5000) + "END"
+
+    for tool_name in ("grep", "glob", "ls", "edit_file", "write_file"):
+        request = SimpleNamespace(tool_call={"name": tool_name}, runtime=SimpleNamespace())
+        result = middleware.wrap_tool_call(
+            request,
+            lambda _: ToolMessage(content=content, name=tool_name, tool_call_id=f"call-{tool_name}"),
+        )
+        assert result.content == content
+
+    assert backend.writes == []
 
 
 def test_filesystem_middleware_keeps_read_file_result_inline_to_avoid_evict_loop() -> None:
     class _Backend:
-        artifacts_root = "/"
-
         def __init__(self):
             self.writes: list[tuple[str, str]] = []
 
@@ -329,10 +380,9 @@ def test_filesystem_middleware_keeps_read_file_result_inline_to_avoid_evict_loop
 
     backend = _Backend()
     middleware = create_agent_filesystem_middleware(
-        tool_token_limit_before_evict=1,
-        context=_runtime().context,
+        1,
+        backend=CompositeBackend(default=backend, routes={}, artifacts_root=f"{WORKDIR_PATH}/outputs"),
     )
-    middleware.backend = backend
     request = SimpleNamespace(tool_call={"name": "read_file"}, runtime=SimpleNamespace())
     content = "x" * 100
 
@@ -345,7 +395,46 @@ def test_filesystem_middleware_keeps_read_file_result_inline_to_avoid_evict_loop
     assert result.content == content
 
 
-def test_custom_composite_glob_only_searches_routes_from_root() -> None:
+def test_filesystem_middleware_keeps_kb_document_result_inline() -> None:
+    class _Backend:
+        def __init__(self):
+            self.writes: list[tuple[str, str]] = []
+
+        def write(self, path: str, content: str):
+            self.writes.append((path, content))
+            return SimpleNamespace(error=None)
+
+    backend = _Backend()
+    middleware = create_agent_filesystem_middleware(
+        1,
+        backend=CompositeBackend(default=backend, routes={}, artifacts_root=f"{WORKDIR_PATH}/outputs"),
+    )
+    request = SimpleNamespace(tool_call={"name": "open_kb_document"}, runtime=SimpleNamespace())
+    content = "x" * 100
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _: ToolMessage(content=content, name="open_kb_document", tool_call_id="call-kb"),
+    )
+
+    assert backend.writes == []
+    assert result.content == content
+
+
+def test_filesystem_middleware_tool_allowlist_excludes_delete() -> None:
+    class _Backend:
+        pass
+
+    middleware = create_agent_filesystem_middleware(
+        backend=CompositeBackend(default=_Backend(), routes={}, artifacts_root=f"{WORKDIR_PATH}/outputs"),
+    )
+
+    tool_names = {tool.name for tool in middleware.tools}
+    assert "delete" not in tool_names
+    assert {"ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute"} <= tool_names
+
+
+def test_official_composite_glob_only_searches_routes_from_root() -> None:
     class _Backend:
         def __init__(self, name: str):
             self.name = name
@@ -357,13 +446,33 @@ def test_custom_composite_glob_only_searches_routes_from_root() -> None:
 
     default = _Backend("default")
     routed = _Backend("skill")
-    backend = CustomCompositeBackend(default=default, routes={"/skills/": routed})
+    backend = CompositeBackend(default=default, routes={"/skills/": routed})
 
     result = backend.glob("**/*.md", path="/home/gem/user-data")
 
     assert result.error is None
     assert default.calls == [("**/*.md", "/home/gem/user-data")]
     assert routed.calls == []
+
+
+def test_official_composite_root_glob_merges_routes_and_propagates_truncated() -> None:
+    class _Backend:
+        def __init__(self, name: str, *, truncated: bool = False):
+            self.name = name
+            self.truncated = truncated
+
+        def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+            return GlobResult(matches=[{"path": f"/{self.name}.md"}], truncated=self.truncated)
+
+    default = _Backend("default")
+    routed = _Backend("skill", truncated=True)
+    backend = CompositeBackend(default=default, routes={"/skills/": routed})
+
+    result = backend.glob("**/*.md", path="/")
+
+    assert result.error is None
+    assert [item["path"] for item in result.matches] == ["/default.md", "/skills/skill.md"]
+    assert result.truncated is True
 
 
 def test_skills_middleware_extracts_slug_for_new_paths() -> None:
@@ -976,10 +1085,9 @@ def test_read_file_tool_returns_multimodal_block_for_small_binary() -> None:
             return ReadResult(file_data={"content": "R0lGODlh", "encoding": "base64"})
 
     middleware = create_agent_filesystem_middleware(
-        tool_token_limit_before_evict=None,
-        context=_runtime().context,
+        None,
+        backend=CompositeBackend(default=_Backend(), routes={}, artifacts_root=f"{WORKDIR_PATH}/outputs"),
     )
-    middleware.backend = _Backend()
     read_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
     runtime = ToolRuntime(
         state={},
@@ -1016,6 +1124,221 @@ def test_provisioner_read_reports_path_traversal(monkeypatch) -> None:
     result = backend.read("/home/gem/user-data/../secret.txt")
 
     assert result.error == "Invalid path '/home/gem/user-data/../secret.txt': path traversal is not allowed"
+
+
+def test_provisioner_read_returns_pagination_window(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+    lines = [f"line-{index}" for index in range(10)]
+    read_calls: list[tuple[int, int | None]] = []
+
+    def _read_binary(path, offset=0, limit=None):
+        read_calls.append((offset, limit))
+        window = lines[offset : offset + limit if limit is not None else None]
+        return ("\n".join(window) + "\n").encode("utf-8")
+
+    monkeypatch.setattr(backend, "_read_binary", _read_binary)
+
+    result = backend.read("/home/gem/user-data/outputs/report.md", offset=2, limit=3)
+
+    assert read_calls == [(2, 3)]
+    assert result.error is None
+    assert result.start_line == 3
+    assert result.end_line == 5
+    assert result.next_offset == 5
+    assert result.total_lines is None
+
+
+def test_provisioner_read_non_positive_limit_reports_no_lines_requested(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+    monkeypatch.setattr(backend, "_read_binary", lambda *_args, **_kwargs: pytest.fail("file was inspected"))
+
+    result = backend.read("/home/gem/user-data/outputs/report.md", offset=0, limit=0)
+
+    assert result.no_lines_requested is True
+    assert result.file_data is None
+
+
+def test_provisioner_read_negative_offset_clamps_to_first_line(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+    read_calls: list[tuple[int, int | None]] = []
+
+    def _read_binary(path, offset=0, limit=None):
+        read_calls.append((offset, limit))
+        return b"first\nsecond\n"
+
+    monkeypatch.setattr(backend, "_read_binary", _read_binary)
+
+    result = backend.read("/home/gem/user-data/outputs/report.md", offset=-5, limit=2)
+
+    assert read_calls == [(0, 2)]
+    assert result.start_line == 1
+    assert result.end_line == 2
+    assert result.next_offset == 2
+
+
+@pytest.mark.asyncio
+async def test_provisioner_aread_rejects_outside_path_before_async_client(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+    monkeypatch.setattr(
+        sandbox_backend_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: pytest.fail("unauthorized path constructed async client"),
+    )
+
+    result = await backend.aread("/tmp/preview_check.jpg")
+
+    assert result.error == "permission denied for read on '/tmp/preview_check.jpg'"
+
+
+@pytest.mark.asyncio
+async def test_provisioner_aread_returns_pagination_and_closes_http_client(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+    read_calls: list[dict] = []
+
+    async def read_file(**kwargs):
+        read_calls.append(kwargs)
+        return SimpleNamespace(data=SimpleNamespace(content="line-2\nline-3\nline-4\n", encoding="utf-8"))
+
+    owned_http_client = _install_async_file_client(
+        monkeypatch,
+        backend,
+        SimpleNamespace(read_file=read_file),
+    )
+
+    result = await backend.aread("/home/gem/user-data/outputs/report.md", offset=2, limit=3)
+
+    assert read_calls == [
+        {
+            "file": "/home/gem/user-data/outputs/report.md",
+            "start_line": 2,
+            "end_line": 5,
+        }
+    ]
+    assert result.file_data == {"content": "line-2\nline-3\nline-4\n", "encoding": "utf-8"}
+    assert result.start_line == 3
+    assert result.end_line == 5
+    assert result.next_offset == 5
+    assert owned_http_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provisioner_aread_image_streams_native_download_without_shell(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+    download_calls: list[dict] = []
+
+    async def download_file(**kwargs):
+        download_calls.append(kwargs)
+        yield b"\x89PNG"
+        yield b"image-bytes"
+
+    _install_async_file_client(monkeypatch, backend, SimpleNamespace(download_file=download_file))
+
+    result = await backend.aread("/home/gem/user-data/uploads/image.png")
+
+    assert result.file_data == {
+        "content": base64.b64encode(b"\x89PNGimage-bytes").decode("ascii"),
+        "encoding": "base64",
+    }
+    assert download_calls == [
+        {
+            "path": "/home/gem/user-data/uploads/image.png",
+            "request_options": {"timeout_in_seconds": backend._command_timeout_seconds},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_provisioner_aread_image_rejects_stream_over_limit(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    monkeypatch.setattr(sandbox_backend_module, "MAX_BINARY_BYTES", 5)
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+
+    async def download_file(**_kwargs):
+        yield b"1234"
+        yield b"567"
+
+    _install_async_file_client(monkeypatch, backend, SimpleNamespace(download_file=download_file))
+
+    result = await backend.aread("/home/gem/user-data/uploads/large.png")
+
+    assert result.file_data is None
+    assert result.error == f"Binary file exceeds maximum preview size of {MAX_BINARY_BYTES} bytes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "expected_error"),
+    [
+        (
+            "/home/gem/user-data/uploads/document.pdf",
+            "read_file does not support PDF or Office documents. "
+            "Use ocr_parse_file to convert the file to Markdown first.",
+        ),
+        (
+            "/home/gem/user-data/uploads/audio.mp3",
+            "read_file only supports UTF-8 text and image files. This file type is not supported.",
+        ),
+    ],
+)
+async def test_provisioner_aread_preserves_known_binary_type_errors(monkeypatch, path, expected_error) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+
+    async def download_file(**_kwargs):
+        yield b"content"
+
+    _install_async_file_client(monkeypatch, backend, SimpleNamespace(download_file=download_file))
+
+    result = await backend.aread(path)
+
+    assert result.file_data is None
+    assert result.error == expected_error
+
+
+@pytest.mark.asyncio
+async def test_provisioner_aread_rejects_unknown_binary_decode_failure(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+
+    async def read_file(**_kwargs):
+        raise RuntimeError("'utf-8' codec can't decode byte 0x89 in position 0")
+
+    _install_async_file_client(monkeypatch, backend, SimpleNamespace(read_file=read_file))
+
+    result = await backend.aread("/home/gem/user-data/uploads/data.unknown")
+
+    assert result.file_data is None
+    assert result.error == "read_file only supports UTF-8 text and image files. This file type is not supported."
+
+
+def test_provisioner_grep_applies_global_max_count_across_roots(monkeypatch) -> None:
+    monkeypatch.setattr("yuxi.agents.backends.sandbox.backend.get_sandbox_provider", lambda: object())
+    backend = ProvisionerSandboxBackend(thread_id="thread-1", uid="user-1")
+    grep_calls: list[dict] = []
+
+    def _super_grep(self, pattern, path=None, glob=None, *, max_count=None):
+        grep_calls.append({"path": path, "max_count": max_count})
+        count = 3 if path == "/home/gem/user-data" else 2
+        matches = [{"path": f"{path}/file-{index}.md", "line": 1, "text": pattern} for index in range(count)]
+        truncated = False
+        if max_count is not None and len(matches) > max_count:
+            matches = matches[:max_count]
+            truncated = True
+        return GrepResult(matches=matches, truncated=truncated)
+
+    monkeypatch.setattr(sandbox_backend_module.BaseSandbox, "grep", _super_grep)
+
+    result = backend.grep("NEEDLE", path="/", max_count=4)
+
+    assert grep_calls == [{"path": "/home/gem/user-data", "max_count": 4}, {"path": "/home/gem/skills", "max_count": 1}]
+    assert len(result.matches) == 4
+    assert result.truncated is True
 
 
 def test_provisioner_download_files_distinguishes_invalid_path_from_read_failure(monkeypatch) -> None:
@@ -1317,12 +1640,13 @@ def test_workdir_paths_are_workspace_relative_and_reject_symlinks(monkeypatch, t
     (projects / "11111111-1111-4111-8111-111111111111").mkdir()
 
     assert backend_paths.runtime_workdir_path("projects/11111111-1111-4111-8111-111111111111") == WORKDIR_PATH
+    assert backend_paths.runtime_workdir_path("agents/skills") == "/home/gem/user-data/agents/skills"
     assert (
         paths.user_workdir_host_dir("user-1", "projects/11111111-1111-4111-8111-111111111111")
         == projects / "11111111-1111-4111-8111-111111111111"
     )
 
-    for unsafe in ("../escape", "/absolute", "agents/skills", "https://example.com/repo"):
+    for unsafe in ("../escape", "/absolute", "agents//skills", "https://example.com/repo"):
         with pytest.raises(ValueError):
             backend_paths.runtime_workdir_path(unsafe)
 

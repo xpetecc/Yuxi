@@ -10,9 +10,9 @@ from yuxi.config.options import system_options
 from yuxi.config.runtime import lite_mode_enabled
 from yuxi.utils.logging_config import logger
 from yuxi.workspace.filesystem import Workspace
-from yuxi.workspace.paths import WORKSPACE_AGENT_CONTEXT_FILES
 
 WORKSPACE_AGENTS_PROMPT_MAX_BYTES = 64 * 1024
+WORKSPACE_BASE_CONTEXT_FILES = ("AGENTS.md", "USER.md")
 DEFAULT_SUMMARY_THRESHOLD_K = 100  # 100K tokens
 DEFAULT_SUMMARY_KEEP_MESSAGES = 10
 DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT = 300
@@ -65,7 +65,7 @@ def _role_can_access(auth: str | None, role: str | None) -> bool:
 def _load_workspace_agent_context(uid: str) -> str:
     sections: list[str] = []
     filesystem = Workspace(uid)
-    for filename in WORKSPACE_AGENT_CONTEXT_FILES:
+    for filename in WORKSPACE_BASE_CONTEXT_FILES:
         try:
             content, truncated = filesystem.read_authorized_file_prefix(
                 f"/agents/{filename}",
@@ -96,6 +96,7 @@ async def build_agent_input_context(
     uid: str,
     run_id: str | None = None,
     request_id: str | None = None,
+    worker_id: str | None = None,
 ) -> dict:
     input_context = dict(agent_config or {})
     agent_context = await asyncio.to_thread(_load_workspace_agent_context, uid)
@@ -104,7 +105,15 @@ async def build_agent_input_context(
         base_prompt = str(input_context.get("system_prompt") or "").rstrip()
         input_context["system_prompt"] = f"{base_prompt}\n\n{agent_context}" if base_prompt else agent_context
 
-    input_context.update({"uid": uid, "thread_id": thread_id, "run_id": run_id, "request_id": request_id})
+    input_context.update(
+        {
+            "uid": uid,
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "request_id": request_id,
+            "worker_id": worker_id,
+        }
+    )
     return input_context
 
 
@@ -137,9 +146,6 @@ def _lite_mode_enabled() -> bool:
     """返回当前进程是否禁止知识库重运行时。"""
 
     return lite_mode_enabled()
-
-
-_LITE_DISABLED_SKILL_SLUGS = frozenset({"knowledge-base"})
 
 
 @dataclass(kw_only=True)
@@ -177,6 +183,11 @@ class BaseContext:
     request_id: str | None = field(
         default=None,
         metadata={"name": "请求 ID", "configurable": False, "hide": True},
+    )
+
+    worker_id: str | None = field(
+        default=None,
+        metadata={"name": "Worker Attempt Owner", "configurable": False, "hide": True},
     )
 
     runtime_scope_id: str | None = field(
@@ -264,6 +275,17 @@ class BaseContext:
             "options": [],
             "description": "可选 Skill 拓展列表，默认选择当前用户可用的全部 Skill 拓展。"
             "Skill 拓展依赖的工具和 MCP 服务器也会被自动挂载。",
+            "type": "list",
+            "kind": "skills",
+        },
+    )
+
+    preload_skills: list[str] = field(
+        default_factory=list,
+        metadata={
+            "name": "预加载 Skills",
+            "options": [],
+            "description": "创建 Agent Graph 时加载完整 Skill 说明，并从首轮开放其依赖工具。默认不预加载。",
             "type": "list",
             "kind": "skills",
         },
@@ -498,13 +520,14 @@ async def resolve_agent_resource_options(
             if server.slug in enabled_slugs
         ]
     if "skills" in fields_to_load:
+        from yuxi.agents.skills.runtime import is_skill_allowed_in_runtime_mode
         from yuxi.agents.skills.service import list_accessible_skills
 
         skills = await list_accessible_skills(db, user)
         options["skills"] = [
             _resource_option(skill.slug, skill.name, skill.description)
             for skill in skills
-            if skill.slug and not (_lite_mode_enabled() and skill.slug in _LITE_DISABLED_SKILL_SLUGS)
+            if skill.slug and is_skill_allowed_in_runtime_mode(skill.slug)
         ]
     if "subagents" in fields_to_load:
         from yuxi.repositories.agent_repository import AgentRepository
@@ -530,25 +553,26 @@ async def normalize_agent_context_config(
     normalized = dict(filtered.get("context") or {})
     field_names = {item.name for item in fields(schema)}
     resource_fields = _AGENT_RESOURCE_FIELDS & field_names
-    if not resource_fields:
-        return normalized
-
     fields_to_load = _resource_fields_requiring_available_keys(normalized, resource_fields)
-    if not fields_to_load:
-        return normalized
+    if fields_to_load:
+        resource_options = await resolve_agent_resource_options(fields_to_load, db=db, user=user)
+        available = {
+            field_name: [option["key"] for option in field_options]
+            for field_name, field_options in resource_options.items()
+        }
 
-    resource_options = await resolve_agent_resource_options(fields_to_load, db=db, user=user)
-    available = {
-        field_name: [option["key"] for option in field_options]
-        for field_name, field_options in resource_options.items()
-    }
+        for field_name, available_keys in available.items():
+            current = normalized.get(field_name)
+            if current is None:
+                normalized[field_name] = available_keys
+            else:
+                normalized[field_name] = _normalize_selected_resource_keys(current, available_keys)
 
-    for field_name, available_keys in available.items():
-        current = normalized.get(field_name)
-        if current is None:
-            normalized[field_name] = available_keys
-        else:
-            normalized[field_name] = _normalize_selected_resource_keys(current, available_keys)
+    if "preload_skills" in field_names:
+        normalized["preload_skills"] = _normalize_selected_resource_keys(
+            normalized.get("preload_skills"),
+            normalized.get("skills", []),
+        )
 
     return normalized
 
@@ -569,22 +593,25 @@ async def prepare_agent_runtime_context(
     from yuxi.storage.postgres.manager import pg_manager
 
     resource_fields = _AGENT_RESOURCE_FIELDS
+    context_resource_fields = resource_fields | {"preload_skills"}
     async with pg_manager.get_async_session_context() as db:
         if not str(getattr(context, "model", "") or "").strip():
             setattr(context, "model", (await system_options.get(db))["default_model"])
         user = await UserRepository().get_by_uid_with_db(db, uid)
         if user is None:
-            for field_name in resource_fields:
+            for field_name in context_resource_fields:
                 if hasattr(context, field_name):
                     setattr(context, field_name, [])
             setattr(context, "_visible_knowledge_bases", [])
             setattr(context, "_effective_skill_slugs", [])
             setattr(context, "_runtime_skills", {})
+            setattr(context, "_preloaded_skills", [])
+            setattr(context, "_preloaded_skill_contents", {})
             return context
 
         raw_resources = {
             field_name: getattr(context, field_name, None)
-            for field_name in resource_fields
+            for field_name in context_resource_fields
             if hasattr(context, field_name)
         }
         normalized = await normalize_agent_context_config(
@@ -593,7 +620,7 @@ async def prepare_agent_runtime_context(
             user=user,
             context_schema=schema,
         )
-        for field_name in resource_fields:
+        for field_name in context_resource_fields:
             if hasattr(context, field_name):
                 setattr(context, field_name, normalized.get(field_name, []))
 
@@ -604,9 +631,14 @@ async def prepare_agent_runtime_context(
             from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context
 
             await resolve_visible_knowledge_bases_for_context(context)
-        skill_scope = await resolve_runtime_skills_for_context(context, db=db, user=user)
+        skill_scope = getattr(context, "_skill_runtime_snapshot", None)
+        if not isinstance(skill_scope, dict):
+            skill_scope = await resolve_runtime_skills_for_context(context, db=db, user=user)
         context.skills = skill_scope["context_skills"]
+        context.preload_skills = skill_scope["context_preload_skills"]
         setattr(context, "_effective_skill_slugs", skill_scope["effective_skills"])
         setattr(context, "_runtime_skills", skill_scope["runtime_skills"])
+        setattr(context, "_preloaded_skills", skill_scope["preloaded_skills"])
+        setattr(context, "_preloaded_skill_contents", skill_scope["preloaded_skill_contents"])
 
     return context

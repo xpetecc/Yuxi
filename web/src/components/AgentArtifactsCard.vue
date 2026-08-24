@@ -19,7 +19,7 @@
         </button>
         <button
           class="item-action-btn"
-          :title="isSaving(file.path) ? '保存中' : '保存到工作区'"
+          :title="isSaving(file.path) ? '保存中' : '保存到个人空间'"
           :disabled="isSaving(file.path)"
           @click.stop="saveToWorkspace(file)"
         >
@@ -91,7 +91,7 @@ const getFileMetaLabel = (path) => {
 }
 
 const openPreview = (file) => {
-  emit('open-preview', { ...file, artifact: true })
+  emit('open-preview', { ...file })
 }
 
 const downloadFile = async (file) => {
@@ -126,15 +126,17 @@ const setSaving = (path, saving) => {
 }
 
 const saveToWorkspace = async (file) => {
-  if (!props.threadId || !file?.path || isSaving(file.path)) return
+  if (!props.threadId || !file?.path || isSaving(file.path)) {
+    return
+  }
 
   setSaving(file.path, true)
   try {
     const result = await threadApi.saveThreadArtifactToWorkspace(props.threadId, file.path)
-    message.success(`已保存到工作区：${result.saved_path}`)
+    message.success(`已保存到个人空间：${result.saved_path}`)
     emit('saved', result)
   } catch (error) {
-    message.error(error?.message || '保存到工作区失败')
+    message.error(error?.message || '保存到个人空间失败')
   } finally {
     setSaving(file.path, false)
   }

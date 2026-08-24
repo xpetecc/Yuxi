@@ -37,7 +37,7 @@ async def _bind_valid_output(
     if run.conversation_id is None:
         conversation = Conversation(
             thread_id=run.conversation_thread_id,
-            workdir_path=f"projects/workdir-{run.conversation_thread_id}",
+            project_id=f"project-{run.conversation_thread_id}",
             uid=run.uid,
             agent_id=run.agent_slug,
             status="active",
@@ -79,7 +79,7 @@ async def _seed_subagent_runs(db, *, relation_child_thread_id: str = "child-thre
             Conversation(
                 id=10,
                 thread_id="parent-thread",
-                workdir_path="projects/workdir-parent-thread",
+                project_id="project-parent-thread",
                 uid="user-1",
                 agent_id="main",
                 status="active",
@@ -87,7 +87,7 @@ async def _seed_subagent_runs(db, *, relation_child_thread_id: str = "child-thre
             Conversation(
                 id=20,
                 thread_id="child-thread",
-                workdir_path="projects/workdir-parent-thread",
+                project_id="project-parent-thread",
                 uid="user-1",
                 agent_id="worker",
                 status="subagent",
@@ -233,14 +233,14 @@ async def test_set_output_message_rejects_wrong_causal_owner_and_accepts_exact_m
     repository = AgentRunRepository(session)
     conversation = Conversation(
         thread_id="output-thread",
-        workdir_path="projects/workdir-output-thread",
+        project_id="project-output-thread",
         uid="user-1",
         agent_id="main",
         status="active",
     )
     other_conversation = Conversation(
         thread_id="other-output-thread",
-        workdir_path="projects/workdir-other-output-thread",
+        project_id="project-other-output-thread",
         uid="user-1",
         agent_id="main",
         status="active",
@@ -632,7 +632,7 @@ async def test_pending_cancel_is_terminal_without_fake_worker_expiry(session):
     """从未执行的 pending Run 由用户取消后直接形成 cancelled 事实。"""
     conversation = Conversation(
         thread_id="cancel-pending-thread",
-        workdir_path="projects/workdir-cancel-pending-thread",
+        project_id="project-cancel-pending-thread",
         uid="user-1",
         agent_id="main",
         status="active",
@@ -909,4 +909,40 @@ async def test_record_run_manifest_is_write_once_and_requires_live_owner(session
             fingerprint="d" * 64,
             worker_id="worker-a:token-1",
             now=now + timedelta(seconds=61),
+        )
+
+
+async def test_lock_memory_write_requires_current_top_level_lease_owner(session):
+    repository = AgentRunRepository(session)
+    run = await _seed_running_run(session, run_id="memory-run", request_id="memory-request")
+    now = utc_now_naive()
+    await repository.mark_running(run.id, worker_id="worker-a:token-1", lease_seconds=60, now=now)
+
+    locked = await repository.lock_memory_write(
+        run.id,
+        uid="user-1",
+        worker_id="worker-a:token-1",
+        conversation_thread_id="attempt-thread",
+        request_id="memory-request",
+        now=now + timedelta(seconds=1),
+    )
+
+    assert locked is run
+    with pytest.raises(ValueError, match="lease owner"):
+        await repository.lock_memory_write(
+            run.id,
+            uid="user-1",
+            worker_id="worker-b:token-2",
+            conversation_thread_id="attempt-thread",
+            request_id="memory-request",
+            now=now + timedelta(seconds=2),
+        )
+    with pytest.raises(ValueError, match="同一顶层 Run"):
+        await repository.lock_memory_write(
+            run.id,
+            uid="other-user",
+            worker_id="worker-a:token-1",
+            conversation_thread_id="attempt-thread",
+            request_id="memory-request",
+            now=now + timedelta(seconds=2),
         )

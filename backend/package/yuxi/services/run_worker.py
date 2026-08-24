@@ -22,7 +22,7 @@ from yuxi.services.agent_request_queue_service import (
     dispatch_next_request,
     recover_pending_dispatches,
 )
-from yuxi.services.agent_run_manifest_service import build_run_manifest, compute_manifest_fingerprint
+from yuxi.services.agent_run_manifest_service import build_run_manifest_result, compute_manifest_fingerprint
 from yuxi.services.chat_service import get_agent_state_view, stream_agent_chat, stream_agent_resume
 from yuxi.services.input_message_service import restore_chat_input_message
 from yuxi.services.run_queue_service import (
@@ -38,7 +38,11 @@ from yuxi.services.run_queue_service import (
     publish_cancel_signal,
     wait_for_cancel_signal,
 )
-from yuxi.services.workdir_service import AuthorizedWorkdir, resolve_authorized_workdir
+from yuxi.services.workdir_service import (
+    AuthorizedWorkdir,
+    resolve_authorized_workdir,
+    resolve_conversation_workdir_path,
+)
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message, User
 from yuxi.storage.redis import get_arq_redis_settings
@@ -109,7 +113,7 @@ async def _validate_run_workdir_binding(run: AgentRun) -> AuthorizedWorkdir:
             if (
                 persisted_scope != str(creator_run.runtime_scope_id)
                 or int(creator_binding.conversation_id) != int(creator_run.conversation_id)
-                or creator_binding.workdir_path != binding.workdir_path
+                or creator_binding.project_id != binding.project_id
             ):
                 raise NonRetryableRunError("SubAgent Run 的 runtime scope 不属于创建者执行树")
     return binding
@@ -292,17 +296,20 @@ async def _release_runtime_if_idle(run: AgentRun) -> bool:
         )
         if result.scalar_one_or_none() is not None:
             return False
-        workdir_path = await db.scalar(
-            select(Conversation.workdir_path).where(Conversation.id == current.conversation_id)
+        conversation = await db.scalar(select(Conversation).where(Conversation.id == current.conversation_id))
+        if conversation is None or conversation.uid != str(current.uid):
+            raise RuntimeError(f"Run {run.id} 的 Conversation 身份不一致")
+        workdir_path = await resolve_conversation_workdir_path(
+            conversation=conversation,
+            uid=str(current.uid),
+            db=db,
         )
-        if not workdir_path:
-            raise RuntimeError(f"Run {run.id} 缺少 Project Workdir，不能安全释放 runtime")
         await asyncio.to_thread(
             get_sandbox_provider().release,
             runtime_scope_id,
             uid=str(current.uid),
             clear_cache_on_delete_failure=True,
-            workdir_path=str(workdir_path),
+            workdir_path=workdir_path,
         )
         current.runtime_cleanup_pending = False
         await db.flush()
@@ -499,17 +506,30 @@ async def reconcile_pending_runtime_cleanups() -> list[str]:
     return cleaned
 
 
-async def persist_run_manifest(*, run: AgentRun, user, worker_id: str) -> None:
+def _require_persisted_manifest_match(persisted_run: AgentRun | None, *, recorded: bool, fingerprint: str) -> None:
+    """重试只能复用与 write-once manifest 完全一致的运行资产。"""
+    if recorded:
+        return
+    if persisted_run is None or persisted_run.manifest_fingerprint != fingerprint:
+        raise RuntimeError("运行资产已在重试前变化，与已固化 manifest 不一致")
+
+
+async def persist_run_manifest(*, run: AgentRun, user, worker_id: str) -> dict:
     """在执行上下文构造前固化运行清单与指纹；固化失败由调用方显式失败。"""
     async with pg_manager.get_async_session_context() as db:
-        manifest = await build_run_manifest(run=run, user=user, db=db)
-        fingerprint = compute_manifest_fingerprint(manifest)
-        await AgentRunRepository(db).record_run_manifest(
+        result = await build_run_manifest_result(run=run, user=user, db=db)
+        fingerprint = compute_manifest_fingerprint(result.manifest)
+        persisted_run, recorded = await AgentRunRepository(db).record_run_manifest(
             run.id,
-            manifest=manifest,
+            manifest=result.manifest,
             fingerprint=fingerprint,
             worker_id=worker_id,
         )
+        _require_persisted_manifest_match(persisted_run, recorded=recorded, fingerprint=fingerprint)
+        return {
+            "normalized_context": result.normalized_context,
+            "skill_runtime_snapshot": result.skill_runtime_snapshot,
+        }
 
 
 async def _load_user(uid: str):
@@ -909,7 +929,7 @@ async def process_agent_run(ctx, run_id: str):
 
         # 运行清单必须在真正构造执行上下文前固化；固化失败时执行不得开始。
         try:
-            await persist_run_manifest(run=run, user=user, worker_id=worker_id)
+            execution_snapshot = await persist_run_manifest(run=run, user=user, worker_id=worker_id)
         except Exception as manifest_error:
             logger.error(f"Failed to persist AgentRun manifest: run={run_id}", exc_info=True)
             await mark_run_terminal(
@@ -978,6 +998,7 @@ async def process_agent_run(ctx, run_id: str):
                     meta=meta,
                     current_user=user,
                     db=db,
+                    execution_snapshot=execution_snapshot,
                 )
             elif run_type in {"chat", "subagent"}:
                 stream = stream_agent_chat(
@@ -988,6 +1009,7 @@ async def process_agent_run(ctx, run_id: str):
                     current_user=user,
                     db=db,
                     save_user_message=False,
+                    execution_snapshot=execution_snapshot,
                 )
             else:
                 raise RuntimeError(f"unsupported run_type after validation: {run_type}")

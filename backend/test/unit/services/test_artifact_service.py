@@ -57,6 +57,8 @@ def live_files(monkeypatch, tmp_path):
         thread_id="thread-1",
         uid="user-1",
         workdir=Workdir("projects/11111111-1111-4111-8111-111111111111", backend),
+        project_id="11111111-1111-4111-8111-111111111111",
+        directory_mode="managed",
     )
 
     async def resolve(**kwargs):
@@ -132,6 +134,19 @@ async def test_artifact_rejects_other_project(live_files):
             path="/home/gem/user-data/projects/other/secret.txt",
         )
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_artifact_rejects_workdir_viewer_scope(live_files):
+    with pytest.raises(HTTPException) as exc:
+        await svc.resolve_thread_artifact_view(
+            thread_id="thread-1",
+            current_uid="user-1",
+            db=object(),
+            path="/outputs/report.md",
+        )
+
+    assert exc.value.status_code == 403
 
 
 @pytest.mark.asyncio

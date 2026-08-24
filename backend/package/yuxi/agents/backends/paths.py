@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import PurePosixPath
 
-from yuxi.workspace.paths import normalize_workdir_path
+from yuxi.workspace.paths import VIRTUAL_PATH_PREFIX, normalize_workdir_path
 
-_raw_prefix = os.getenv("SANDBOX_VIRTUAL_PATH_PREFIX")
-VIRTUAL_PATH_PREFIX = (_raw_prefix.strip() if _raw_prefix else "/home/gem/user-data") or "/home/gem/user-data"
-if not VIRTUAL_PATH_PREFIX.startswith("/"):
-    VIRTUAL_PATH_PREFIX = f"/{VIRTUAL_PATH_PREFIX}"
 VIRTUAL_SKILLS_PATH = "/home/gem/skills"
 VIRTUAL_PERSONAL_SKILLS_PATH = f"{VIRTUAL_PATH_PREFIX.rstrip('/')}/agents/skills"
 LARGE_TOOL_RESULTS_DIR_NAME = "large_tool_results"
@@ -25,7 +20,7 @@ def runtime_workdir_path(workdir_path: str) -> str:
 def workdir_runtime_paths(workdir_path: str) -> tuple[str, str]:
     """返回当前 Workdir runtime 的大结果与对话历史目录。"""
     normalized = PurePosixPath(str(workdir_path)).as_posix().rstrip("/")
-    if not normalized.startswith(f"{VIRTUAL_PATH_PREFIX.rstrip('/')}/projects/"):
+    if not normalized.startswith(f"{VIRTUAL_PATH_PREFIX.rstrip('/')}/"):
         raise ValueError("workdir_path must be a Backend runtime path")
     outputs = f"{normalized}/outputs"
     return (
