@@ -45,6 +45,22 @@ export const databaseApi = {
     return apiAdminPost(`/api/knowledge/databases/${kbId}/stats/repair`, {})
   },
 
+  detectVirtualFolders: async (kbId) => {
+    return apiAdminGet(`/api/knowledge/databases/${kbId}/virtual-folders/detect`)
+  },
+
+  startVirtualFolderMigration: async (kbId) => {
+    return apiAdminPost(`/api/knowledge/databases/${kbId}/virtual-folders/migrate`, {})
+  },
+
+  streamVirtualFolderMigration: async (kbId, taskId, signal) => {
+    return apiAdminGet(
+      `/api/knowledge/databases/${kbId}/virtual-folders/migrations/${taskId}/events`,
+      { signal },
+      'response'
+    )
+  },
+
   /**
    * 更新知识库信息
    * @param {string} kbId - 知识库ID
@@ -143,6 +159,18 @@ export const documentApi = {
     return apiAdminPost(`/api/knowledge/databases/${kbId}/folders`, {
       folder_name: folderName,
       parent_id: parentId
+    })
+  },
+
+  renameFolder: async (kbId, folderId, folderName) => {
+    return apiAdminPut(`/api/knowledge/databases/${kbId}/folders/${folderId}/rename`, {
+      folder_name: folderName
+    })
+  },
+
+  moveDocument: async (kbId, documentId, newParentId) => {
+    return apiAdminPut(`/api/knowledge/databases/${kbId}/documents/${documentId}/move`, {
+      new_parent_id: newParentId
     })
   },
 
