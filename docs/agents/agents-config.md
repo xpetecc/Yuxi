@@ -40,8 +40,8 @@ metadata 可以定义展示名称、说明、控件类型、选项和角色权�
 | `mcps` | 可使用的已启用 MCP 服务器 |
 | `skills` | 可见并可激活的 Skill |
 | `preload_skills` | 从首轮请求加载完整说明和依赖的 Skill 子集 |
-| `summary_threshold`、`summary_keep_messages` | 上下文压缩阈值和保留消息数 |
-| `summary_prompt`、`summary_tool_result_token_limit`、`summary_l2_trigger_ratio` | 摘要提示词、工具结果预览上限和 L2 触发比例 |
+| `summary_threshold`、`summary_keep_messages` | 上下文压缩的唯一压力阈值和摘要后保留消息数 |
+| `summary_prompt`、`summary_tool_result_token_limit` | 摘要提示词和工具结果预览上限 |
 | `max_execution_steps`、`model_retry_times` | 单次运行步数和模型重试次数 |
 
 ## 资源选择语义
@@ -50,7 +50,7 @@ metadata 可以定义展示名称、说明、控件类型、选项和角色权�
 
 `ChatBotContext.subagents` 未配置或保存空列表时，使用当前用户可见的全部子智能体；显式选择后才收窄范围。子智能体不能继续调用下一层子智能体。
 
-这些字段只会缩小当前用户已经拥有的权限。LITE 模式会清空知识库资源，不会因为 Agent 配置保留了知识库 ID 而重新启用知识能力。
+这些字段只会缩小当前用户已经拥有的权限。
 
 ## 自定义 Context 字段
 

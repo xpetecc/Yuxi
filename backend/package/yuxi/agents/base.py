@@ -218,6 +218,8 @@ class BaseAgent:
             version="v3",
             transformers=[CustomTransformer],
         )
+        if on_prepared := kwargs.get("on_prepared"):
+            await on_prepared()
         subagent_routes: dict[tuple[str, ...], dict[str, str]] = {}
         route_task = asyncio.create_task(_collect_subagent_routes(run, context.thread_id, subagent_routes))
         try:
@@ -226,6 +228,8 @@ class BaseAgent:
                 namespace = list(params.get("namespace") or [])
                 method = event.get("method")
                 data = params.get("data")
+                sequence = event.get("seq")
+                timestamp = params.get("timestamp")
                 subagent_route = _subagent_route_for_namespace(subagent_routes, namespace)
 
                 if method == "custom":
@@ -236,7 +240,12 @@ class BaseAgent:
                     metadata = dict(metadata or {})
                     actual_thread_id = (subagent_route or {}).get("thread_id") or _metadata_thread_id(metadata)
                     metadata["namespace"] = namespace
-                    metadata["stream_event"] = {"method": method, "namespace": namespace}
+                    metadata["stream_event"] = {
+                        "method": method,
+                        "namespace": namespace,
+                        "seq": sequence,
+                        "timestamp": timestamp,
+                    }
                     if subagent_route:
                         metadata.update(subagent_route)
                     if actual_thread_id:
@@ -250,6 +259,8 @@ class BaseAgent:
                     event_payload = {
                         "method": method,
                         "namespace": namespace,
+                        "seq": sequence,
+                        "timestamp": timestamp,
                         "data": _json_safe(data),
                     }
                     actual_thread_id = (subagent_route or {}).get("thread_id") or _metadata_thread_id(params)

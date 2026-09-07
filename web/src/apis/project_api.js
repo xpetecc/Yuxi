@@ -1,14 +1,4 @@
-import { apiGet, apiPost } from './base'
-
-const buildQuery = (params) => {
-  const query = new URLSearchParams()
-  Object.entries(params).forEach(([key, value]) => {
-    if (value !== undefined && value !== null && value !== '') {
-      query.set(key, String(value))
-    }
-  })
-  return query.toString()
-}
+import { apiDelete, apiGet, apiPost, apiPut, buildQuery } from './base'
 
 export const projectApi = {
   getProjects: () => apiGet('/api/projects'),
@@ -22,6 +12,10 @@ export const projectApi = {
         ...(mode === 'linked' && path ? { path: String(path).replace(/^\/+/, '') } : {})
       }
     }),
+
+  renameProject: (projectId, name) => apiPut(`/api/projects/${projectId}`, { name }),
+
+  deleteProject: (projectId) => apiDelete(`/api/projects/${projectId}`),
 
   getHistoryCandidates: ({ query = '', limit = 20, offset = 0 } = {}) =>
     apiGet(`/api/projects/history-candidates?${buildQuery({ q: query, limit, offset })}`)

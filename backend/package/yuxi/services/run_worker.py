@@ -10,14 +10,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from arq.worker import RetryJob
+from arq.worker import RetryJob, func
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from yuxi.agents.backends.paths import runtime_workdir_path
 from yuxi.agents.backends.sandbox.provider import get_sandbox_provider
 from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db
 from yuxi.agents.skills.service import init_builtin_skills
-from yuxi.config.runtime import lite_mode_enabled
+from yuxi.config import get_int_env
 from yuxi.repositories.agent_run_repository import TERMINAL_RUN_STATUSES, AgentRunRepository
 from yuxi.services.agent_request_queue_service import (
     dispatch_next_request,
@@ -35,10 +35,20 @@ from yuxi.services.run_queue_service import (
     append_run_stream_event,
     clear_cancel_signal,
     get_redis_client,
-    has_cancel_signal,
-    publish_cancel_signal,
+    publish_cancel_signals,
     wait_for_cancel_signal,
 )
+from yuxi.services.scheduled_agent_service import (
+    claim_and_dispatch_due_jobs,
+    recover_scheduled_dispatches,
+)
+from yuxi.services.task_queue_service import (
+    TASK_RECONCILIATION_HEALTH_KEY,
+    TASK_RECONCILIATION_HEALTH_TTL_SECONDS,
+    TASK_RECONCILIATION_SECONDS,
+    reconcile_and_publish_tasks,
+)
+from yuxi.services.task_service import TASKER_DEFAULT_TIMEOUT_SECONDS, process_task
 from yuxi.services.workdir_service import (
     AuthorizedWorkdir,
     resolve_authorized_workdir,
@@ -48,6 +58,7 @@ from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message, User
 from yuxi.storage.redis import get_arq_redis_settings
 from yuxi.utils.auth_utils import AuthUtils
+from yuxi.utils.datetime_utils import utc_now_naive
 from yuxi.utils.logging_config import logger
 from yuxi.utils.thread_utils import extract_thread_id
 
@@ -60,6 +71,12 @@ RUN_HEARTBEAT_SECONDS = 30
 SUPPORTED_RUN_TYPES = {"chat", "resume", "subagent"}
 WORKER_ID = f"worker-{uuid.uuid4().hex}"
 _RECONCILIATION_TASK_KEY = "agent_run_reconciliation_task"
+_TASK_RECONCILIATION_TASK_KEY = "durable_task_reconciliation_task"
+
+
+def worker_max_jobs() -> int:
+    """读取单个 ARQ worker 的并发任务上限。"""
+    return get_int_env("ARQ_MAX_JOBS", 10)
 
 
 class RetryableRunError(RetryJob):
@@ -160,25 +177,14 @@ class RunContext:
         await self.cancel_event.wait()
 
     async def is_cancelled(self) -> bool:
-        if self.cancel_event.is_set():
-            return True
-        if await _is_cancel_requested(self.run_id):
-            self.cancel_event.set()
-            return True
-        if await has_cancel_signal(self.run_id):
-            self.cancel_event.set()
-            return True
-        return False
+        return self.cancel_event.is_set()
 
     async def _watch_cancel_signal(self) -> None:
-        while not self.cancel_event.is_set():
-            cancelled = await wait_for_cancel_signal(
-                self.run_id,
-                poll_timeout_seconds=RUN_CANCEL_POLL_SECONDS,
-            )
-            if cancelled:
-                self.cancel_event.set()
-                return
+        await wait_for_cancel_signal(
+            self.run_id,
+            poll_interval_seconds=RUN_CANCEL_POLL_SECONDS,
+        )
+        self.cancel_event.set()
 
     async def _watch_durable_cancel(self) -> None:
         """低频轮询 PostgreSQL，确保 Redis 丢信号时取消仍然 fail-closed。"""
@@ -340,7 +346,7 @@ async def _finish_execution_tree_children(run: AgentRun) -> None:
         repo = AgentRunRepository(db)
         descendants = await repo.cancel_active_execution_tree_descendants(run)
         await db.commit()
-    await _publish_execution_tree_cancel_signals(descendants)
+    await publish_cancel_signals([run_id for run_id, _thread_id in descendants])
 
 
 async def _get_run(run_id: str):
@@ -382,29 +388,6 @@ async def _flush_writer_best_effort(writer: ChunkedEventWriter) -> None:
         logger.warning(f"Failed to flush non-authoritative AgentRun events: run={writer.run_id}", exc_info=True)
 
 
-async def _clear_cancel_signal_best_effort(run_id: str) -> None:
-    """取消键清理失败不能覆盖已经提交的 Run 终态。"""
-
-    try:
-        await clear_cancel_signal(run_id)
-    except Exception:
-        logger.warning(f"Failed to clear non-authoritative AgentRun cancel signal: run={run_id}", exc_info=True)
-
-
-async def _publish_execution_tree_cancel_signals(cancelled: list[tuple[str, str]]) -> None:
-    """尽力通知已由 PostgreSQL 收敛的后代 Run 停止执行。"""
-
-    if not cancelled:
-        return
-    results = await asyncio.gather(
-        *(publish_cancel_signal(run_id) for run_id, _thread_id in cancelled),
-        return_exceptions=True,
-    )
-    for (run_id, _thread_id), result in zip(cancelled, results, strict=True):
-        if isinstance(result, BaseException):
-            logger.warning("Failed to publish execution-tree cancel signal: run=%s", run_id, exc_info=result)
-
-
 async def mark_run_running(run_id: str, worker_id: str) -> bool:
     async with pg_manager.get_async_session_context() as db:
         repo = AgentRunRepository(db)
@@ -436,11 +419,7 @@ async def release_run_lease_for_retry(run_id: str, worker_id: str) -> bool:
             run = await repo.get_run(run_id)
             if run is not None:
                 cancelled_descendants = await repo.cancel_active_execution_tree_descendants(run)
-    if cancelled_descendants:
-        await asyncio.gather(
-            *(publish_cancel_signal(child_id) for child_id, _thread_id in cancelled_descendants),
-            return_exceptions=True,
-        )
+    await publish_cancel_signals([child_id for child_id, _thread_id in cancelled_descendants])
     return released
 
 
@@ -466,7 +445,7 @@ async def mark_run_terminal(
         if changed and run is not None:
             cancelled_descendants = await repo.cancel_active_execution_tree_descendants(run)
         persisted_status = run.status if run else None
-    await _publish_execution_tree_cancel_signals(cancelled_descendants)
+    await publish_cancel_signals([child_id for child_id, _thread_id in cancelled_descendants])
     return TerminalTransition(status=persisted_status, changed=changed)
 
 
@@ -474,11 +453,7 @@ async def reconcile_expired_run_leases(*, now: datetime | None = None) -> list[s
     """收敛过期 Run ownership；重复或并发执行只返回本次实际转换的 Run。"""
     async with pg_manager.get_async_session_context() as db:
         runs, cancelled_descendants = await AgentRunRepository(db).reconcile_expired_leases(now=now)
-    if cancelled_descendants:
-        await asyncio.gather(
-            *(publish_cancel_signal(child_id) for child_id, _thread_id in cancelled_descendants),
-            return_exceptions=True,
-        )
+    await publish_cancel_signals([child_id for child_id, _thread_id in cancelled_descendants])
     await reconcile_pending_runtime_cleanups()
     return [run.id for run in runs]
 
@@ -531,6 +506,27 @@ async def persist_run_manifest(*, run: AgentRun, user, worker_id: str) -> dict:
             "normalized_context": result.normalized_context,
             "skill_runtime_snapshot": result.skill_runtime_snapshot,
         }
+
+
+async def _record_run_timing_best_effort(
+    run_id: str,
+    worker_id: str,
+    phase: str,
+    *,
+    observed_at: datetime | None = None,
+) -> None:
+    """记录单次 Run 阶段时间；观测失败不覆盖业务执行结果。"""
+    try:
+        async with pg_manager.get_async_session_context() as db:
+            repository = AgentRunRepository(db)
+            if phase == "prepared":
+                await repository.record_prepared(run_id, worker_id=worker_id, observed_at=observed_at)
+            elif phase == "first_output":
+                await repository.record_first_output(run_id, worker_id=worker_id, observed_at=observed_at)
+            else:
+                raise ValueError(f"不支持的 AgentRun timing phase: {phase}")
+    except Exception:
+        logger.warning("Failed to persist AgentRun timing: run=%s, phase=%s", run_id, phase, exc_info=True)
 
 
 async def _load_user(uid: str):
@@ -635,6 +631,26 @@ def _loading_chunk_size(chunk: dict) -> int:
         if isinstance(value, str):
             total += len(value)
     return total
+
+
+def _contains_model_output(chunk: dict) -> bool:
+    """识别非空模型文本、推理文本或工具调用数据。"""
+    stream_event = chunk.get("stream_event")
+    if not isinstance(stream_event, dict):
+        return False
+
+    event_type = stream_event.get("type")
+    if event_type == "message_delta":
+        return any(
+            isinstance(stream_event.get(key), str) and bool(stream_event[key])
+            for key in ("content", "reasoning_content", "additional_reasoning_content")
+        )
+    if event_type in {"tool_call", "tool_call_delta"}:
+        return any(
+            stream_event.get(key) is not None and stream_event.get(key) != "" and stream_event.get(key) != {}
+            for key in ("name", "args", "args_delta")
+        )
+    return False
 
 
 def _flush_loading_chunk_immediately(chunk: dict) -> bool:
@@ -782,7 +798,6 @@ async def process_agent_run(ctx, run_id: str):
         cleanup_was_pending = bool(getattr(run, "runtime_cleanup_pending", False))
         if cleanup_was_pending:
             await _require_runtime_cleanup(run, f"Run {run_id} 的 execution tree 尚未完成 runtime cleanup")
-        if cleanup_was_pending:
             await _append_end_event(run_id, run.status, thread_id=run.conversation_thread_id)
         if run.status == "completed":
             await dispatch_next_request(
@@ -989,7 +1004,17 @@ async def process_agent_run(ctx, run_id: str):
             metadata_event,
             thread_id=thread_id,
         )
+
+        async def record_prepared() -> None:
+            await _record_run_timing_best_effort(
+                run_id,
+                worker_id,
+                "prepared",
+                observed_at=utc_now_naive(),
+            )
+
         terminal_set = False
+        first_output_observed = bool(getattr(run, "first_output_at", None))
         pending_interrupt: tuple[dict, str | None] | None = None
         async with pg_manager.get_async_session_context() as db:
             if run_type == "resume":
@@ -1000,6 +1025,7 @@ async def process_agent_run(ctx, run_id: str):
                     current_user=user,
                     db=db,
                     execution_snapshot=execution_snapshot,
+                    on_prepared=record_prepared,
                 )
             elif run_type in {"chat", "subagent"}:
                 stream = stream_agent_chat(
@@ -1011,6 +1037,7 @@ async def process_agent_run(ctx, run_id: str):
                     db=db,
                     save_user_message=False,
                     execution_snapshot=execution_snapshot,
+                    on_prepared=record_prepared,
                 )
             else:
                 raise RuntimeError(f"unsupported run_type after validation: {run_type}")
@@ -1019,6 +1046,22 @@ async def process_agent_run(ctx, run_id: str):
                 for chunk in _iter_json_chunks(chunk_bytes):
                     target_thread_id = _chunk_thread_id(chunk, thread_id)
                     if chunk.get("status") == "loading":
+                        if (
+                            not first_output_observed
+                            and target_thread_id == thread_id
+                            and _contains_model_output(chunk)
+                        ):
+                            first_output_observed = True
+                            first_output_at = utc_now_naive()
+                            await writer.append(chunk, thread_id=target_thread_id)
+                            await writer.flush(target_thread_id)
+                            await _record_run_timing_best_effort(
+                                run_id,
+                                worker_id,
+                                "first_output",
+                                observed_at=first_output_at,
+                            )
+                            continue
                         await writer.append(chunk, thread_id=target_thread_id)
                         continue
 
@@ -1368,7 +1411,7 @@ async def process_agent_run(ctx, run_id: str):
         if final_run and final_run.status in TERMINAL_RUN_STATUSES:
             await _finish_execution_tree_children(final_run)
         if final_run and final_run.status == "cancelled":
-            await _clear_cancel_signal_best_effort(run_id)
+            await clear_cancel_signal(run_id)
         # completed 后尝试派发线程的下一个排队请求
         if final_run and final_run.status == "completed" and not final_run.runtime_cleanup_pending:
             await dispatch_next_request(
@@ -1399,11 +1442,38 @@ async def _reconcile_agent_run_leases_forever() -> None:
             if cleaned_ids:
                 logger.warning(f"Reconciled pending runtime cleanups: count={len(cleaned_ids)}")
             await recover_pending_dispatches()
+            await recover_scheduled_dispatches()
+            await claim_and_dispatch_due_jobs()
             await _publish_reconciliation_health()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.error("Failed to reconcile expired AgentRun leases", exc_info=True)
+
+
+async def _reconcile_durable_tasks_forever() -> None:
+    """周期收敛失联通用 Task，并补发持久 pending 意图。"""
+    while True:
+        await asyncio.sleep(TASK_RECONCILIATION_SECONDS)
+        try:
+            reconciled = await reconcile_and_publish_tasks()
+            if reconciled:
+                logger.warning("Reconciled expired durable tasks: count=%s", len(reconciled))
+            await _publish_task_reconciliation_health()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Failed to reconcile durable tasks", exc_info=True)
+
+
+async def _publish_task_reconciliation_health() -> None:
+    """续租 worker 的 Durable Task 收敛与 pending 补发能力。"""
+    redis = await get_redis_client()
+    await redis.set(
+        TASK_RECONCILIATION_HEALTH_KEY,
+        WORKER_ID,
+        ex=TASK_RECONCILIATION_HEALTH_TTL_SECONDS,
+    )
 
 
 async def _publish_reconciliation_health() -> None:
@@ -1425,7 +1495,7 @@ async def _worker_startup(ctx):
     AuthUtils.require_security_secrets()
     ctx["worker_id"] = WORKER_ID
     pg_manager.initialize()
-    await pg_manager.require_current_schema(include_knowledge=not lite_mode_enabled())
+    await pg_manager.require_current_schema()
     async with pg_manager.get_async_session_context() as session:
         from yuxi.config.options import (
             ensure_options_in_db,
@@ -1450,18 +1520,28 @@ async def _worker_startup(ctx):
         logger.warning(f"Reconciled expired AgentRun leases at startup: count={len(reconciled_ids)}")
     await reconcile_pending_runtime_cleanups()
     await recover_pending_dispatches()
+    await reconcile_and_publish_tasks()
+    await _publish_task_reconciliation_health()
+    await recover_scheduled_dispatches()
+    await claim_and_dispatch_due_jobs()
     await _publish_reconciliation_health()
     ctx[_RECONCILIATION_TASK_KEY] = asyncio.create_task(_reconcile_agent_run_leases_forever())
+    ctx[_TASK_RECONCILIATION_TASK_KEY] = asyncio.create_task(_reconcile_durable_tasks_forever())
 
 
 async def _worker_shutdown(ctx):
     """关闭 worker 共享连接。"""
 
     if isinstance(ctx, dict):
-        reconciliation_task = ctx.pop(_RECONCILIATION_TASK_KEY, None)
-        if reconciliation_task is not None:
-            reconciliation_task.cancel()
-            await asyncio.gather(reconciliation_task, return_exceptions=True)
+        reconciliation_tasks = [
+            ctx.pop(_RECONCILIATION_TASK_KEY, None),
+            ctx.pop(_TASK_RECONCILIATION_TASK_KEY, None),
+        ]
+        reconciliation_tasks = [task for task in reconciliation_tasks if task is not None]
+        for task in reconciliation_tasks:
+            task.cancel()
+        if reconciliation_tasks:
+            await asyncio.gather(*reconciliation_tasks, return_exceptions=True)
     from yuxi.services.run_queue_service import close_queue_clients
 
     await close_queue_clients()
@@ -1469,7 +1549,11 @@ async def _worker_shutdown(ctx):
 
 
 class WorkerSettings:
-    functions = [process_agent_run]
+    functions = [
+        process_agent_run,
+        func(process_task, timeout=TASKER_DEFAULT_TIMEOUT_SECONDS + 30),
+    ]
+    max_jobs = worker_max_jobs()
     max_tries = 2
     retry_jobs = True
     # 单任务最长执行时间（秒），可配置：超长图谱构建/深度检索场景需调大，

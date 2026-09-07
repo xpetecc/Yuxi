@@ -11,10 +11,11 @@ from yuxi.storage.postgres.manager import (
     KnowledgeBase,
     PostgresManager,
 )
+from yuxi.storage.postgres.models_business import AgentRun
 
 
 def test_business_and_knowledge_metadata_are_disjoint():
-    """LITE create_all 的业务 metadata 不得携带知识与评估表。"""
+    """业务与知识域 metadata 保持独立，迁移器分别创建两个域。"""
 
     assert BusinessBase is not KnowledgeBase
     assert "users" in BusinessBase.metadata.tables
@@ -31,18 +32,18 @@ async def test_require_current_schema_rejects_missing_or_incompatible_domains(mo
 
     monkeypatch.setattr(manager, "get_schema_versions", lambda: _async_value({}))
     with pytest.raises(RuntimeError, match=r"business=missing .*knowledge=missing"):
-        await manager.require_current_schema(include_knowledge=True)
+        await manager.require_current_schema()
 
     monkeypatch.setattr(manager, "get_schema_versions", lambda: _async_value({"business": 99}))
     with pytest.raises(RuntimeError, match=r"business=99"):
-        await manager.require_current_schema(include_knowledge=False)
+        await manager.require_current_schema()
 
     monkeypatch.setattr(
         manager,
         "get_schema_versions",
         lambda: _async_value({"business": BUSINESS_SCHEMA_VERSION, "knowledge": KNOWLEDGE_SCHEMA_VERSION}),
     )
-    await manager.require_current_schema(include_knowledge=True)
+    await manager.require_current_schema()
 
 
 async def _async_value(value):
@@ -54,6 +55,31 @@ def test_project_uid_foreign_key_has_schema_convergence_name():
     projects = BusinessBase.metadata.tables["projects"]
 
     assert [constraint.name for constraint in projects.foreign_key_constraints] == ["fk_projects_uid_users"]
+
+
+def test_project_lifecycle_columns_and_constraint_are_in_fresh_schema():
+    """Fresh schema 与升级收敛必须共享 Project 软删除契约。"""
+    projects = BusinessBase.metadata.tables["projects"]
+
+    assert projects.c.status.nullable is False
+    assert "deleted_at" in projects.c
+    assert "ck_projects_status" in {constraint.name for constraint in projects.constraints}
+
+
+def test_agent_run_serialization_does_not_project_removed_redis_cursor():
+    """AgentRun 序列化不再暴露已删除的 Redis 游标字段。"""
+    run = AgentRun(
+        id="run-1",
+        conversation_thread_id="thread-1",
+        runtime_scope_id="thread-1",
+        agent_slug="main",
+        uid="user-1",
+        request_id="request-1",
+        input_payload={},
+    )
+
+    assert "last_event_id" not in AgentRun.__table__.c
+    assert "last_event_id" not in run.to_dict()
 
 
 class _RecordingConnection:
@@ -123,6 +149,32 @@ async def test_ensure_business_schema_backfills_subagent_thread_columns_before_d
     assert statements.index("created_by_parent_run_id") < statements.index(
         "DROP COLUMN IF EXISTS created_by_parent_run_id"
     )
+    assert "ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active'" in statements
+    assert "ADD COLUMN IF NOT EXISTS deleted_at" in statements
+    assert "ADD CONSTRAINT ck_projects_status" in statements
+
+
+@pytest.mark.asyncio
+async def test_migrate_business_schema_v4_to_v5_drops_agent_run_cursor():
+    """v4→v5 迁移执行删除 AgentRun Redis 游标列的 DDL。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.migrate_business_schema_v4_to_v5()
+
+    assert connection.statements == [
+        "ALTER TABLE IF EXISTS agent_runs DROP COLUMN IF EXISTS last_event_id",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_migrate_business_schema_v5_to_v6_adds_agent_run_timing():
+    """v5→v6 迁移执行 AgentRun 阶段时间字段 DDL。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.migrate_business_schema_v5_to_v6()
+
+    assert connection.statements == [
+        "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS prepared_at TIMESTAMP WITHOUT TIME ZONE",
+        "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS first_output_at TIMESTAMP WITHOUT TIME ZONE",
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,16 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { agentApi, databaseApi, mcpApi, skillApi, toolApi } from '@/apis'
-import { useRuntimeCapabilitiesStore } from '@/stores/runtimeCapabilities'
-import { isDefaultAllAgentResourceKind } from '@/utils/agentConfigUtils'
+import { isDefaultAllAgentResourceKind, normalizeAgent } from '@/utils/agentConfigUtils'
 import { handleChatError } from '@/utils/errorHandler'
-
-function normalizeAgent(agent) {
-  const agentId = agent?.agent_id || agent?.slug || agent?.id
-  return agentId
-    ? { ...agent, id: agentId, agent_id: agentId, slug: agent?.slug || agentId }
-    : agent
-}
 
 export const BUILTIN_AGENT_ID = 'default-chatbot'
 
@@ -87,12 +79,8 @@ export const useAgentStore = defineStore(
 
     async function fetchMentionResources() {
       try {
-        const runtimeCapabilitiesStore = useRuntimeCapabilitiesStore()
-        await runtimeCapabilitiesStore.ensureLoaded()
         const [dbsRes, mcpsRes, skillsRes] = await Promise.all([
-          runtimeCapabilitiesStore.knowledgeEnabled
-            ? databaseApi.getAccessibleDatabases().catch(() => ({ databases: [] }))
-            : Promise.resolve({ databases: [] }),
+          databaseApi.getAccessibleDatabases().catch(() => ({ databases: [] })),
           mcpApi.getMcpServers().catch(() => ({ data: [] })),
           skillApi.listAccessibleSkills().catch(() => ({ data: [] }))
         ])

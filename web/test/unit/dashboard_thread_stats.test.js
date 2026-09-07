@@ -88,13 +88,35 @@ test('dashboardApi.getThreadStats 正确拼接时间范围与智能体过滤参�
   })
 })
 
+test('dashboardApi.getAllStats 始终请求知识库统计', async () => {
+  await withServer(async (server) => {
+    storageValues.clear()
+    const requests = []
+    const responses = {
+      '/api/dashboard/stats': { total_conversations: 3 },
+      '/api/dashboard/stats/users': { total_users: 2 },
+      '/api/dashboard/stats/tools': { total_calls: 4 },
+      '/api/dashboard/stats/agents': { total_agents: 1 },
+      '/api/dashboard/stats/knowledge': { total_databases: 5 }
+    }
+    globalThis.fetch = async (input) => {
+      const url = String(input)
+      requests.push(url)
+      return jsonResponse(responses[url])
+    }
+
+    await prepareStores(server)
+    const { dashboardApi } = await server.ssrLoadModule('/src/apis/dashboard_api.js')
+    const result = await dashboardApi.getAllStats()
+
+    assert.deepEqual(requests, Object.keys(responses))
+    assert.deepEqual(result.knowledge, responses['/api/dashboard/stats/knowledge'])
+  })
+})
+
 test('会话分析保持紧凑摘要、彩色排行、无刷新 loading 与统一头像 fallback', () => {
   const source = readFileSync(
     new URL('../../src/components/dashboard/ThreadStatsComponent.vue', import.meta.url),
-    'utf8'
-  )
-  const agentStatsSource = readFileSync(
-    new URL('../../src/components/dashboard/AgentStatsComponent.vue', import.meta.url),
     'utf8'
   )
   const refreshButton = source.match(/<button[^>]*class="refresh-btn"[\s\S]*?<\/button>/)?.[0]
@@ -109,7 +131,6 @@ test('会话分析保持紧凑摘要、彩色排行、无刷新 loading 与统�
   assert.equal(refreshButton.includes(':loading'), false)
   assert.match(source, /:default-src="generatePixelAvatar\(record\.agent_id\)"/)
   assert.match(source, /:default-src="generatePixelAvatar\(record\.uid\)"/)
-  assert.match(agentStatsSource, /:default-src="generatePixelAvatar\(record\.agent_id\)"/)
   assert.match(source, /role="switch"/)
   assert.match(source, /:aria-checked="includeSubagents"/)
   assert.match(source, /includeSubagents \? '包含' : '不含'/)
@@ -117,6 +138,17 @@ test('会话分析保持紧凑摘要、彩色排行、无刷新 loading 与统�
   assert.equal((summarySource.match(/<DashboardMetricCard/g) || []).length, 4)
   assert.equal(summarySource.includes('Token'), false)
   assert.match(agentChartSource, /color:\s*\(params\)\s*=>\s*getColorByIndex\(params\.dataIndex\)/)
+})
+
+test('智能体分析不再渲染 TOP 5 排行且保留分布图', () => {
+  const source = readFileSync(
+    new URL('../../src/components/dashboard/AgentStatsComponent.vue', import.meta.url),
+    'utf8'
+  )
+
+  assert.match(source, /对话\/工具调用分布 \(TOP 3\)/)
+  assert.doesNotMatch(source, /表现最佳智能体|top_performing_agents|topPerformers|performerColumns/)
+  assert.doesNotMatch(source, /<a-table/)
 })
 
 test('会话统计只允许最新筛选请求提交结果和结束 loading', () => {

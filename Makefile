@@ -1,5 +1,5 @@
 
-.PHONY: up up-lite down logs lint format seed reset test verify-trust audit-dependencies audit-licenses
+.PHONY: up down logs lint format seed reset test verify-trust audit-dependencies audit-licenses
 
 PYTEST_ARGS ?=
 BACKEND_PYTHON ?= $(shell cat backend/.python-version)
@@ -19,6 +19,10 @@ reset:
 		echo "Error: .env file not found. Please create it from .env.template"; \
 		exit 1; \
 	fi
+	@if [ -n "$$YUXI_STATE_DIR" ] || grep -Eq '^[[:space:]]*YUXI_STATE_DIR[[:space:]]*=[[:space:]]*[^[:space:]#]' .env; then \
+		echo "Refusing to delete an external YUXI_STATE_DIR; stop the slot and remove its exact state directory explicitly." >&2; \
+		exit 1; \
+	fi
 	docker compose down
 	rm -rf docker/volumes
 	docker compose up -d
@@ -26,15 +30,8 @@ reset:
 	@until docker compose exec -T api true >/dev/null 2>&1; do sleep 2; done
 	$(MAKE) seed
 
-up-lite:
-	@if [ ! -f .env ]; then \
-		echo "Error: .env file not found. Please create it from .env.template"; \
-		exit 1; \
-	fi
-	LITE_MODE=true docker compose up -d postgres redis minio api worker web
-
 logs:
-	@docker logs --tail=50 api-dev
+	@docker compose logs --tail=50 api
 	@echo "\n\nBranch: $$(git branch --show-current)"
 	@echo "Commit ID: $$(git rev-parse HEAD)"
 	@echo "System: $$(uname -a)"
@@ -75,9 +72,7 @@ audit-dependencies:
 	@if uv audit --script scripts/dependency-audit-fixtures/vulnerable.py > /tmp/yuxi-python-audit-negative.log 2>&1; then echo "Expected the vulnerable Python fixture to fail"; exit 1; fi
 	grep -q "aiohttp 3.14.1 has" /tmp/yuxi-python-audit-negative.log
 	grep -q "GHSA-cq5v-8q36-5273" /tmp/yuxi-python-audit-negative.log
-	@if cd scripts/dependency-audit-fixtures/node && pnpm audit --audit-level=high --prod > /tmp/yuxi-node-audit-negative.log 2>&1; then echo "Expected the vulnerable Node.js fixture to fail"; exit 1; fi
-	grep -q "js-yaml" /tmp/yuxi-node-audit-negative.log
-	grep -q "GHSA-5p4m-2wfm-xmqj" /tmp/yuxi-node-audit-negative.log
+	bash scripts/dependency-audit-fixtures/run-node-negative-control.sh
 
 audit-licenses:
 	cd backend && UV_PYTHON=$(BACKEND_PYTHON) uv run --isolated --no-dev --with pip-licenses pip-licenses --from mixed --format markdown

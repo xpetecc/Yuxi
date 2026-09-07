@@ -11,30 +11,6 @@ from yuxi.services import chat_service as svc
 from yuxi.services.input_message_service import build_chat_input_message
 
 
-@pytest.fixture
-def stub_system_options(monkeypatch: pytest.MonkeyPatch):
-    async def get_system_options(_option, _db=None):
-        return {
-            "enable_content_guard": False,
-            "enable_content_guard_llm": False,
-            "content_guard_llm_model": "",
-        }
-
-    monkeypatch.setattr(type(svc.system_options), "get", get_system_options)
-
-
-@pytest.fixture
-def stub_content_guard(monkeypatch: pytest.MonkeyPatch):
-    class FakeGuard:
-        async def check(self, _content):
-            return False
-
-        async def check_with_keywords(self, _content):
-            return False
-
-    monkeypatch.setattr(svc.content_guard, "configured", lambda *_args: FakeGuard())
-
-
 async def _fake_normalize_agent_context_config(context, **_kwargs):
     return dict(context or {})
 
@@ -59,14 +35,6 @@ async def _fake_save_messages_from_langgraph_state(
     del agent_instance, thread_id, conv_repo, config_dict, context, trace_info
     del run_id, request_id, worker_id, interrupt_error_type, interrupt_error_message, token_usage
     return complete_run or interrupt_run
-
-
-async def _fake_guard_check(_content):
-    return False
-
-
-async def _fake_guard_check_with_keywords(_content):
-    return False
 
 
 async def _fake_interrupts(agent, langgraph_config, make_chunk, meta, thread_id, context):
@@ -120,19 +88,7 @@ def _patch_stream_scaffolding(
     monkeypatch.setattr(
         svc, "save_messages_from_langgraph_state", save_messages or _fake_save_messages_from_langgraph_state
     )
-    monkeypatch.setattr(svc.content_guard, "check", _fake_guard_check)
-    monkeypatch.setattr(svc.content_guard, "check_with_keywords", _fake_guard_check_with_keywords)
     monkeypatch.setattr(svc, "check_and_handle_interrupts", _fake_interrupts)
-    monkeypatch.setattr(svc, "get_user_skills_root_dir", lambda _uid: None)
-
-    class FakeSandboxBackend:
-        def __init__(self, **_kwargs):
-            pass
-
-        def ensure_available(self):
-            return "sandbox-1"
-
-    monkeypatch.setattr(svc, "ProvisionerSandboxBackend", FakeSandboxBackend)
     monkeypatch.setattr(
         svc,
         "_build_langfuse_run_context",
@@ -156,9 +112,13 @@ class _FakeContext:
 class _FakeSession:
     def __init__(self):
         self.commit_count = 0
+        self.rollback_count = 0
 
     async def commit(self):
         self.commit_count += 1
+
+    async def rollback(self):
+        self.rollback_count += 1
 
 
 class _FakeConvRepo:
@@ -245,6 +205,52 @@ def test_subagent_attachment_root_rejects_same_path_from_different_project() -> 
         )
 
 
+@pytest.mark.asyncio
+async def test_persist_agent_run_langfuse_trace_commits_before_execution(monkeypatch: pytest.MonkeyPatch):
+    calls: dict[str, object] = {}
+    db = _FakeSession()
+
+    class FakeRunRepository:
+        def __init__(self, session):
+            assert session is db
+
+        async def set_langfuse_trace_id(self, run_id, trace_id, *, worker_id):
+            calls.update(run_id=run_id, trace_id=trace_id, worker_id=worker_id)
+            return SimpleNamespace(id=run_id)
+
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepository)
+
+    await svc._persist_agent_run_langfuse_trace(
+        db=db,
+        meta={"run_id": "run-1", "worker_id": "worker-1"},
+        run_context=SimpleNamespace(trace_id="trace-1"),
+    )
+
+    assert calls == {"run_id": "run-1", "trace_id": "trace-1", "worker_id": "worker-1"}
+    assert db.commit_count == 1
+    assert db.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_agent_run_langfuse_trace_skips_when_langfuse_is_disabled(monkeypatch: pytest.MonkeyPatch):
+    db = _FakeSession()
+
+    class UnexpectedRepository:
+        def __init__(self, _session):
+            raise AssertionError("Langfuse 禁用时不应访问 AgentRun repository")
+
+    monkeypatch.setattr(svc, "AgentRunRepository", UnexpectedRepository)
+
+    await svc._persist_agent_run_langfuse_trace(
+        db=db,
+        meta={"run_id": "run-1", "worker_id": "worker-1"},
+        run_context=SimpleNamespace(trace_id=None),
+    )
+
+    assert db.commit_count == 0
+    assert db.rollback_count == 0
+
+
 def test_build_langfuse_run_context_reads_evaluation_from_invocation_meta(monkeypatch: pytest.MonkeyPatch):
     calls: dict[str, object] = {}
 
@@ -285,18 +291,39 @@ def test_build_langfuse_run_context_reads_evaluation_from_invocation_meta(monkey
 
 @pytest.mark.asyncio
 async def test_stream_agent_chat_commits_before_stream_and_persists_langfuse_context(
-    stub_system_options,
-    stub_content_guard,
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: dict[str, object] = {}
+    lifecycle: list[str] = []
     db = _FakeSession()
+
+    class FakeRunRepository:
+        def __init__(self, session):
+            assert session is db
+
+        async def set_langfuse_trace_id(self, run_id, trace_id, *, worker_id):
+            calls["trace_binding"] = {
+                "run_id": run_id,
+                "trace_id": trace_id,
+                "worker_id": worker_id,
+            }
+            return SimpleNamespace(id=run_id)
+
+    monkeypatch.setattr(svc, "AgentRunRepository", FakeRunRepository)
 
     class FakeAgent:
         context_schema = _FakeContext
 
         async def stream_messages_with_state(self, messages, input_context=None, **kwargs):
-            assert db.commit_count == 1
+            await kwargs.pop("on_prepared")()
+            assert db.commit_count == 2
+            assert calls["trace_binding"] == {
+                "run_id": "run-1",
+                "trace_id": "trace-seeded",
+                "worker_id": "worker-1",
+            }
+            assert lifecycle == ["prepared"]
+            lifecycle.append("streaming")
             calls["stream_messages"] = messages
             calls["stream_input_context"] = input_context
             calls["stream_kwargs"] = kwargs
@@ -378,20 +405,25 @@ async def test_stream_agent_chat_commits_before_stream_and_persists_langfuse_con
             trace_id="trace-seeded",
         ),
         get_trace_info=lambda _run_context: {
-            "langfuse_trace_id": "trace-runtime",
+            "langfuse_trace_id": "trace-seeded",
             "langfuse_session_id": "thread-1",
         },
         flush_langfuse=lambda: calls.setdefault("flushed", True),
     )
 
+    async def on_prepared() -> None:
+        assert db.commit_count == 2
+        lifecycle.append("prepared")
+
     chunks = []
     async for chunk in svc.stream_agent_chat(
         agent_slug="test-agent",
         thread_id="thread-1",
-        meta={"request_id": "req-1"},
+        meta={"request_id": "req-1", "run_id": "run-1", "worker_id": "worker-1"},
         input_message=build_chat_input_message("hello"),
         current_user=SimpleNamespace(id=1, uid="user-1", role="user", department_id="dept-1"),
         db=db,
+        on_prepared=on_prepared,
     ):
         chunks.append(json.loads(chunk.decode("utf-8")))
 
@@ -401,7 +433,7 @@ async def test_stream_agent_chat_commits_before_stream_and_persists_langfuse_con
             "temperature": 0.1,
             "uid": "user-1",
             "thread_id": "thread-1",
-            "run_id": None,
+            "run_id": "run-1",
             "request_id": "req-1",
         }.items()
     )
@@ -415,7 +447,7 @@ async def test_stream_agent_chat_commits_before_stream_and_persists_langfuse_con
     assert "current.txt" in model_message.content
     assert "history.txt" in model_message.content
     assert calls["saved_state"]["trace_info"] == {
-        "langfuse_trace_id": "trace-runtime",
+        "langfuse_trace_id": "trace-seeded",
         "langfuse_session_id": "thread-1",
     }
     assert calls["saved_state"]["context"].thread_id == "thread-1"
@@ -434,12 +466,83 @@ async def test_stream_agent_chat_commits_before_stream_and_persists_langfuse_con
     assert init_attachment["path"].endswith("/uploads/current.txt")
     assert calls["flushed"] is True
     assert isinstance(calls["stream_messages"][0], HumanMessage)
+    assert lifecycle == ["prepared", "streaming"]
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_chat_partial_failure_preserves_trace_info(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: dict[str, object] = {}
+
+    class FakeAgent:
+        context_schema = _FakeContext
+
+        async def stream_messages_with_state(self, messages, input_context=None, **kwargs):
+            del messages, input_context, kwargs
+            yield "messages", (AIMessageChunk(content="partial"), {"node": "llm"})
+            raise RuntimeError("stream failed")
+
+    @asynccontextmanager
+    async def fake_session_context():
+        yield _FakeSession()
+
+    async def fake_save_partial_message(
+        _conv_repo,
+        thread_id,
+        *,
+        full_msg,
+        trace_info,
+        **_kwargs,
+    ):
+        calls["partial"] = {
+            "thread_id": thread_id,
+            "content": full_msg.content,
+            "trace_info": trace_info,
+        }
+
+    _patch_stream_scaffolding(
+        monkeypatch,
+        agent=FakeAgent(),
+        build_run_context=lambda **_kwargs: SimpleNamespace(
+            callbacks=[],
+            metadata={},
+            tags=[],
+            trace_id="trace-partial",
+        ),
+        get_trace_info=lambda _run_context: {
+            "langfuse_trace_id": "trace-partial",
+            "langfuse_session_id": "thread-partial",
+        },
+    )
+    monkeypatch.setattr(svc.pg_manager, "get_async_session_context", fake_session_context)
+    monkeypatch.setattr(svc, "save_partial_message", fake_save_partial_message)
+
+    chunks = []
+    async for chunk in svc.stream_agent_chat(
+        agent_slug="test-agent",
+        thread_id="thread-partial",
+        meta={"request_id": "request-partial"},
+        input_message=build_chat_input_message("hello"),
+        current_user=SimpleNamespace(id=1, uid="user-1", role="user", department_id="dept-1"),
+        db=_FakeSession(),
+    ):
+        chunks.append(json.loads(chunk.decode("utf-8")))
+
+    assert calls["partial"] == {
+        "thread_id": "thread-partial",
+        "content": "partial",
+        "trace_info": {
+            "langfuse_trace_id": "trace-partial",
+            "langfuse_session_id": "thread-partial",
+        },
+    }
+    assert chunks[-1]["status"] == "error"
+    assert chunks[-1]["error_type"] == "unexpected_error"
 
 
 @pytest.mark.asyncio
 async def test_stream_agent_chat_creates_conversation_before_reading_workdir(
-    stub_system_options,
-    stub_content_guard,
     monkeypatch: pytest.MonkeyPatch,
 ):
     class FakeAgent:
@@ -519,9 +622,7 @@ async def test_stream_agent_chat_creates_conversation_before_reading_workdir(
 
 
 @pytest.mark.asyncio
-async def test_stream_agent_chat_sandbox_bootstrap_failure_prevents_agent_execution(
-    stub_system_options,
-    stub_content_guard,
+async def test_stream_agent_chat_does_not_bootstrap_sandbox_before_agent_execution(
     monkeypatch: pytest.MonkeyPatch,
 ):
     agent_started = False
@@ -533,14 +634,7 @@ async def test_stream_agent_chat_sandbox_bootstrap_failure_prevents_agent_execut
             nonlocal agent_started
             del messages, input_context, kwargs
             agent_started = True
-            yield "messages", (AIMessageChunk(content="must not run"), {"node": "llm"})
-
-    @asynccontextmanager
-    async def fake_session_context():
-        yield _FakeSession()
-
-    async def fake_save_partial_message(*_args, **_kwargs):
-        return None
+            yield "messages", (AIMessageChunk(content="runs without sandbox"), {"node": "llm"})
 
     _patch_stream_scaffolding(
         monkeypatch,
@@ -554,16 +648,20 @@ async def test_stream_agent_chat_sandbox_bootstrap_failure_prevents_agent_execut
         ),
     )
 
-    class FailingSandboxBackend:
+    class UnexpectedSandboxBackend:
         def __init__(self, **_kwargs):
-            pass
+            raise AssertionError("纯文本 Agent 流不应构造 Sandbox Backend")
 
         def ensure_available(self):
-            raise RuntimeError("sandbox bootstrap failed")
+            raise AssertionError("纯文本 Agent 流不应预创建 Sandbox")
 
-    monkeypatch.setattr(svc, "ProvisionerSandboxBackend", FailingSandboxBackend)
-    monkeypatch.setattr(svc.pg_manager, "get_async_session_context", fake_session_context)
-    monkeypatch.setattr(svc, "save_partial_message", fake_save_partial_message)
+    monkeypatch.setattr(svc, "ProvisionerSandboxBackend", UnexpectedSandboxBackend, raising=False)
+    monkeypatch.setattr(
+        svc,
+        "get_user_skills_root_dir",
+        lambda _uid: (_ for _ in ()).throw(AssertionError("纯文本 Agent 流不应物化 Skill 投影根")),
+        raising=False,
+    )
 
     chunks = []
     async for chunk in svc.stream_agent_chat(
@@ -576,16 +674,13 @@ async def test_stream_agent_chat_sandbox_bootstrap_failure_prevents_agent_execut
     ):
         chunks.append(json.loads(chunk.decode("utf-8")))
 
-    assert agent_started is False
-    assert chunks[-1]["status"] == "error"
-    assert "sandbox bootstrap failed" in chunks[-1]["error_message"]
-    assert all(chunk.get("status") != "finished" for chunk in chunks)
+    assert agent_started is True
+    assert chunks[-1]["status"] == "finished"
+    assert any(chunk.get("response") == "runs without sandbox" for chunk in chunks)
 
 
 @pytest.mark.asyncio
 async def test_stream_agent_chat_output_persistence_failure_is_terminal_error(
-    stub_system_options,
-    stub_content_guard,
     monkeypatch: pytest.MonkeyPatch,
 ):
     class FakeAgent:
@@ -635,8 +730,6 @@ async def test_stream_agent_chat_output_persistence_failure_is_terminal_error(
 
 @pytest.mark.asyncio
 async def test_stream_agent_chat_maps_raw_protocol_events_to_yuxi_stream_events(
-    stub_system_options,
-    stub_content_guard,
     monkeypatch: pytest.MonkeyPatch,
 ):
     class FakeGraph:
@@ -741,8 +834,6 @@ async def test_stream_agent_chat_maps_raw_protocol_events_to_yuxi_stream_events(
 
 @pytest.mark.asyncio
 async def test_stream_agent_chat_emits_realtime_agent_state_from_values(
-    stub_system_options,
-    stub_content_guard,
     monkeypatch: pytest.MonkeyPatch,
 ):
     class FakeGraph:
@@ -788,8 +879,6 @@ async def test_stream_agent_chat_emits_realtime_agent_state_from_values(
 
 @pytest.mark.asyncio
 async def test_stream_agent_chat_maps_custom_compression_event_to_context_compression_chunk(
-    stub_system_options,
-    stub_content_guard,
     monkeypatch: pytest.MonkeyPatch,
 ):
     class FakeGraph:

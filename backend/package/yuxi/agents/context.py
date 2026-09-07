@@ -7,7 +7,6 @@ from typing import Any, get_origin
 
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE
 from yuxi.config.options import system_options
-from yuxi.config.runtime import lite_mode_enabled
 from yuxi.utils.logging_config import logger
 from yuxi.workspace.filesystem import Workspace
 
@@ -16,7 +15,6 @@ WORKSPACE_BASE_CONTEXT_FILES = ("AGENTS.md", "USER.md")
 DEFAULT_SUMMARY_THRESHOLD_K = 100  # 100K tokens
 DEFAULT_SUMMARY_KEEP_MESSAGES = 10
 DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT = 300
-DEFAULT_SUMMARY_L2_TRIGGER_RATIO = 0.4
 DEFAULT_MAX_EXECUTION_STEPS = 300
 DEFAULT_TOOL_RESULT_EVICTION_K_TOKENS = 3
 DEFAULT_YUXI_SUMMARY_PROMPT = """你是对话上下文压缩助手。
@@ -127,25 +125,21 @@ def filter_config_by_role(
         return {}
 
     schema = context_schema or BaseContext
+    schema_fields = fields(schema)
+    declared_fields = {item.name for item in schema_fields}
     restricted_fields = {
-        f.name
-        for f in fields(schema)
-        if f.metadata.get("auth") and not _role_can_access(str(f.metadata.get("auth")), role)
+        item.name
+        for item in schema_fields
+        if item.metadata.get("auth") and not _role_can_access(str(item.metadata.get("auth")), role)
     }
-    if not restricted_fields:
-        return dict(config_json)
 
     filtered = dict(config_json)
     context = filtered.get("context")
     if isinstance(context, dict):
-        filtered["context"] = {key: value for key, value in context.items() if key not in restricted_fields}
+        filtered["context"] = {
+            key: value for key, value in context.items() if key in declared_fields and key not in restricted_fields
+        }
     return filtered
-
-
-def _lite_mode_enabled() -> bool:
-    """返回当前进程是否禁止知识库重运行时。"""
-
-    return lite_mode_enabled()
 
 
 @dataclass(kw_only=True)
@@ -332,23 +326,9 @@ class BaseContext:
         metadata={
             "name": "摘要工具结果 token 上限",
             "description": (
-                "上下文摘要 L1 清洗历史工具结果时，超过该 token 数的 ToolMessage 会写入 outputs，"
+                "确定性压缩历史工具结果时，超过该 token 数的 ToolMessage 会写入 outputs，"
                 "并在上下文中保留不超过该 token 数的预览；未超过则保持原样。默认 "
                 f"{DEFAULT_SUMMARY_TOOL_RESULT_TOKEN_LIMIT}。"
-            ),
-            "type": "number",
-            "auth": "admin",
-        },
-    )
-
-    summary_l2_trigger_ratio: float = field(
-        default=DEFAULT_SUMMARY_L2_TRIGGER_RATIO,
-        metadata={
-            "name": "L2 摘要触发比例",
-            "description": (
-                "L1 结构精简后，剩余上下文超过 摘要触发阈值 * 该比例 时才进入 L2 summary。"
-                "建议范围 0.1 到 1.0，值越小越容易触发 L2，默认 "
-                f"{DEFAULT_SUMMARY_L2_TRIGGER_RATIO}。"
             ),
             "type": "number",
             "auth": "admin",
@@ -500,15 +480,12 @@ async def resolve_agent_resource_options(
             if tool.get("slug")
         ]
     if "knowledges" in fields_to_load:
-        if _lite_mode_enabled():
-            options["knowledges"] = []
-        else:
-            from yuxi.knowledge.runtime import knowledge_base
+        from yuxi.knowledge.runtime import knowledge_base
 
-            databases = await knowledge_base.get_databases_by_user(user)
-            options["knowledges"] = [
-                _resource_option(item.kb_id, item.name, item.description) for item in databases if item.kb_id
-            ]
+        databases = await knowledge_base.get_databases_by_user(user)
+        options["knowledges"] = [
+            _resource_option(item.kb_id, item.name, item.description) for item in databases if item.kb_id
+        ]
     if "mcps" in fields_to_load:
         from yuxi.agents.mcp.service import get_all_mcp_servers, get_enabled_mcp_server_slugs
 
@@ -520,14 +497,11 @@ async def resolve_agent_resource_options(
             if server.slug in enabled_slugs
         ]
     if "skills" in fields_to_load:
-        from yuxi.agents.skills.runtime import is_skill_allowed_in_runtime_mode
         from yuxi.agents.skills.service import list_accessible_skills
 
         skills = await list_accessible_skills(db, user)
         options["skills"] = [
-            _resource_option(skill.slug, skill.name, skill.description)
-            for skill in skills
-            if skill.slug and is_skill_allowed_in_runtime_mode(skill.slug)
+            _resource_option(skill.slug, skill.name, skill.description) for skill in skills if skill.slug
         ]
     if "subagents" in fields_to_load:
         from yuxi.repositories.agent_repository import AgentRepository
@@ -550,8 +524,8 @@ async def normalize_agent_context_config(
     schema = context_schema or BaseContext
     raw_context = dict(context) if isinstance(context, dict) else {}
     filtered = filter_config_by_role({"context": raw_context}, getattr(user, "role", None), schema)
-    normalized = dict(filtered.get("context") or {})
     field_names = {item.name for item in fields(schema)}
+    normalized = dict(filtered.get("context") or {})
     resource_fields = _AGENT_RESOURCE_FIELDS & field_names
     fields_to_load = _resource_fields_requiring_available_keys(normalized, resource_fields)
     if fields_to_load:
@@ -624,13 +598,9 @@ async def prepare_agent_runtime_context(
             if hasattr(context, field_name):
                 setattr(context, field_name, normalized.get(field_name, []))
 
-        if _lite_mode_enabled():
-            context.knowledges = []
-            setattr(context, "_visible_knowledge_bases", [])
-        else:
-            from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context
+        from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context
 
-            await resolve_visible_knowledge_bases_for_context(context)
+        await resolve_visible_knowledge_bases_for_context(context)
         skill_scope = getattr(context, "_skill_runtime_snapshot", None)
         if not isinstance(skill_scope, dict):
             skill_scope = await resolve_runtime_skills_for_context(context, db=db, user=user)

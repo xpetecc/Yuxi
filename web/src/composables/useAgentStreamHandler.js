@@ -108,13 +108,23 @@ export function useAgentStreamHandler({
             const localHumanMessage = threadState.onGoingConv.msgChunks[resolvedRequestId]?.find(
               (item) => item?.type === 'human' || item?.role === 'user'
             )
+            const resolvedRunId =
+              request_id && chunk.stream_thread_id === threadId ? chunk.stream_run_id : null
+            const initMetadata = { ...(msg?.extra_metadata || {}) }
+            delete initMetadata.run_id
             const initMessage = {
               ...msg,
               id: msg?.id || resolvedRequestId,
+              created_at: msg.created_at || localHumanMessage?.created_at,
               extra_metadata: {
-                ...(msg?.extra_metadata || {}),
+                ...initMetadata,
                 request_id: resolvedRequestId
               }
+            }
+            delete initMessage.run_id
+            if (resolvedRunId) {
+              initMessage.run_id = resolvedRunId
+              initMessage.extra_metadata.run_id = resolvedRunId
             }
             if (localHumanMessage?.image_content && !initMessage.image_content) {
               initMessage.message_type = localHumanMessage.message_type || initMessage.message_type
@@ -266,7 +276,7 @@ export function useAgentStreamHandler({
             threadState.pendingInterrupt = pendingInterrupt
           }
         }
-        // 如果有 message 字段，显示提示（例如：敏感内容检测）
+        // 如果有 message 字段，显示中断原因。
         if (chunkMessage) {
           message.info(chunkMessage)
         }

@@ -15,23 +15,22 @@ share the same runtime behavior once they reach the worker.
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal
 
 from langchain.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.types import Command
 from yuxi.agents.backends.paths import runtime_workdir_path
-from yuxi.agents.backends.sandbox import ProvisionerSandboxBackend
 from yuxi.agents.base import _json_safe
 from yuxi.agents.buildin import agent_manager
 from yuxi.agents.context import build_agent_input_context, normalize_agent_context_config
-from yuxi.agents.skills.service import get_user_skills_root_dir
 from yuxi.agents.state import AgentStatePayload
-from yuxi.config.options import system_options
 from yuxi.repositories.agent_repository import AgentRepository
 from yuxi.repositories.agent_run_repository import AgentRunRepository
 from yuxi.repositories.conversation_repository import ConversationRepository
+from yuxi.repositories.model_message_audit_repository import ModelMessageAuditRepository
 from yuxi.repositories.subagent_thread_repository import SubagentThreadRepository
+from yuxi.repositories.tool_message_audit_repository import ToolMessageAuditRepository
 from yuxi.services.attachment_service import serialize_attachment
 from yuxi.services.input_message_service import AgentRunInputMessage
 from yuxi.services.langfuse_service import (
@@ -40,13 +39,15 @@ from yuxi.services.langfuse_service import (
     flush_langfuse,
     get_trace_info,
 )
+from yuxi.services.model_message_audit_service import ModelMessageAuditCollector
 from yuxi.services.project_service import create_implicit_project
-from yuxi.services.run_queue_service import publish_cancel_signal
+from yuxi.services.run_queue_service import publish_cancel_signals
 from yuxi.services.subagent_run_service import serialize_subagent_run_state
+from yuxi.services.tool_message_audit_service import ToolMessageAuditCollector
 from yuxi.services.workdir_service import resolve_conversation_workdir_path
 from yuxi.storage.postgres.manager import pg_manager
-from yuxi.storage.postgres.models_business import Agent, User
-from yuxi.utils.guard import content_guard
+from yuxi.storage.postgres.models_business import MODEL_AUDIT_MESSAGE_TYPE, Agent, User
+from yuxi.utils.datetime_utils import utc_now_naive
 from yuxi.utils.logging_config import logger
 from yuxi.utils.question_utils import (
     normalize_questions as _normalize_interrupt_questions,
@@ -145,6 +146,64 @@ def _build_langfuse_run_context(
         extra_metadata=extra_metadata,
         extra_tags=extra_tags,
     )
+
+
+def _build_model_message_audit_collector(meta: dict, thread_id: str) -> ModelMessageAuditCollector | None:
+    """仅为具备完整 AgentRun 因果归属的 worker 流创建 Model 审计器。"""
+    run_id = str(meta.get("run_id") or "").strip()
+    request_id = str(meta.get("request_id") or "").strip()
+    worker_id = str(meta.get("worker_id") or "").strip()
+    if not run_id or not request_id or not worker_id:
+        return None
+    return ModelMessageAuditCollector(
+        run_id=run_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        worker_id=worker_id,
+    )
+
+
+def _build_tool_message_audit_collector(
+    model_audit: ModelMessageAuditCollector | None,
+) -> ToolMessageAuditCollector | None:
+    """复用已校验的 AgentRun 因果归属创建 ToolMessage 审计器。"""
+    if model_audit is None:
+        return None
+    return ToolMessageAuditCollector(
+        run_id=model_audit.run_id,
+        request_id=model_audit.request_id,
+        thread_id=model_audit.thread_id,
+        worker_id=model_audit.worker_id,
+    )
+
+
+def _is_root_tool_audit_event(event: dict[str, Any], thread_id: str) -> bool:
+    """只接受根 StreamMux 或已明确路由回当前线程的 Tool lifecycle。"""
+    namespace = event.get("namespace") or []
+    event_thread_id = event.get("thread_id")
+    return event_thread_id == thread_id or (not namespace and not event_thread_id)
+
+
+async def _persist_agent_run_langfuse_trace(*, db, meta: dict, run_context: LangfuseRunContext) -> None:
+    """在模型执行前用独立短事务固化 Run 的 Langfuse trace。"""
+    run_id = meta.get("run_id")
+    worker_id = meta.get("worker_id")
+    trace_id = run_context.trace_id
+    if not run_id or not worker_id or not trace_id:
+        return
+
+    try:
+        run = await AgentRunRepository(db).set_langfuse_trace_id(
+            str(run_id),
+            str(trace_id),
+            worker_id=str(worker_id),
+        )
+        if run is None:
+            raise ValueError(f"AgentRun 不存在: {run_id}")
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
 
 
 def _normalize_agent_artifact_path(path: object, workdir_path: str | None) -> object:
@@ -414,36 +473,12 @@ async def _stream_agent_events(agent, messages, *, input_context=None, **kwargs)
         yield mode, payload
 
 
-async def _ensure_persistent_sandbox(*, runtime_scope_id: str, uid: str, workdir_path: str) -> None:
-    """物化 Sandbox 的用户级挂载根并确认持久 runtime 可用。"""
-    # Workdir 已在 ARQ 发布前物化；这里只补齐首次构图前缺失的 Skill 投影根。
-    await asyncio.to_thread(get_user_skills_root_dir, uid)
-    backend = ProvisionerSandboxBackend(
-        thread_id=runtime_scope_id,
-        uid=uid,
-        workdir_path=workdir_path,
-    )
-    await asyncio.to_thread(backend.ensure_available)
-
-
 async def _get_existing_message_ids(conv_repo: ConversationRepository, thread_id: str) -> set[str]:
-    existing_messages = await conv_repo.get_messages_by_thread_id(thread_id)
-    return {
-        msg.extra_metadata["id"]
-        for msg in existing_messages
-        if msg.extra_metadata and "id" in msg.extra_metadata and isinstance(msg.extra_metadata["id"], str)
-    }
+    return await conv_repo.get_message_source_ids_by_thread_id(thread_id)
 
 
-async def _save_ai_message(
-    conv_repo: ConversationRepository,
-    thread_id: str,
-    msg_dict: dict,
-    trace_info: dict[str, Any] | None = None,
-    run_id: str | None = None,
-    request_id: str | None = None,
-    commit: bool = True,
-):
+def _ai_message_content_and_tool_calls(msg_dict: dict) -> tuple[str, list[dict]]:
+    """提取 AIMessage 可展示正文和兼容 ToolCall 投影。"""
     content = msg_dict.get("content", "")
     tool_calls_data = msg_dict.get("tool_calls") or []
     if isinstance(content, list):
@@ -458,6 +493,39 @@ async def _save_ai_message(
         )
     elif not isinstance(content, str):
         content = str(content)
+    return content, list(tool_calls_data)
+
+
+async def _project_ai_tool_calls(
+    conv_repo: ConversationRepository,
+    *,
+    message_id: int,
+    tool_calls_data: list[dict],
+    commit: bool,
+) -> None:
+    """从 AIMessage 单向投影阶段二仍需兼容的 ToolCall。"""
+    for tool_call in tool_calls_data:
+        await conv_repo.add_tool_call(
+            message_id=message_id,
+            tool_name=tool_call.get("name") or "unknown",
+            tool_input=tool_call.get("args", {}),
+            status="pending",
+            langgraph_tool_call_id=tool_call.get("id"),
+            commit=commit,
+        )
+
+
+async def _save_ai_message(
+    conv_repo: ConversationRepository,
+    thread_id: str,
+    msg_dict: dict,
+    trace_info: dict[str, Any] | None = None,
+    run_id: str | None = None,
+    request_id: str | None = None,
+    commit: bool = True,
+    project_tool_calls: bool = True,
+):
+    content, tool_calls_data = _ai_message_content_and_tool_calls(msg_dict)
     extra_metadata = dict(msg_dict)
     if trace_info:
         extra_metadata.update(trace_info)
@@ -473,16 +541,13 @@ async def _save_ai_message(
         commit=commit,
     )
 
-    if ai_msg and tool_calls_data:
-        for tc in tool_calls_data:
-            await conv_repo.add_tool_call(
-                message_id=ai_msg.id,
-                tool_name=tc.get("name") or "unknown",
-                tool_input=tc.get("args", {}),
-                status="pending",
-                langgraph_tool_call_id=tc.get("id"),
-                commit=commit,
-            )
+    if ai_msg and tool_calls_data and project_tool_calls:
+        await _project_ai_tool_calls(
+            conv_repo,
+            message_id=ai_msg.id,
+            tool_calls_data=tool_calls_data,
+            commit=commit,
+        )
 
     return ai_msg
 
@@ -505,20 +570,6 @@ async def _save_tool_message(conv_repo: ConversationRepository, msg_dict: dict, 
         status="success",
         commit=commit,
     )
-
-
-async def _publish_execution_tree_cancel_signals(cancelled: list[tuple[str, str]]) -> None:
-    """尽力通知已由 PostgreSQL 收敛的后代 Run 停止执行。"""
-
-    if not cancelled:
-        return
-    results = await asyncio.gather(
-        *(publish_cancel_signal(run_id) for run_id, _thread_id in cancelled),
-        return_exceptions=True,
-    )
-    for (run_id, _thread_id), result in zip(cancelled, results, strict=True):
-        if isinstance(result, BaseException):
-            logger.warning("Failed to publish execution-tree cancel signal: run=%s", run_id, exc_info=result)
 
 
 async def save_partial_message(
@@ -588,7 +639,7 @@ async def save_partial_message(
                     raise ValueError("AgentRun 部分输出已写入但 interrupted 终态未能在同一事务提交")
                 cancelled_descendants = await run_repo.cancel_active_execution_tree_descendants(terminal_run)
             await conv_repo.db.commit()
-            await _publish_execution_tree_cancel_signals(cancelled_descendants)
+            await publish_cancel_signals([run_id for run_id, _thread_id in cancelled_descendants])
         elif run_id and interrupt_run:
             raise ValueError("AgentRun 中断输出消息未能持久化")
         return message
@@ -600,6 +651,90 @@ async def save_partial_message(
         if interrupt_run:
             raise
         return None
+
+
+async def _reconcile_model_audit_message(
+    conv_repo: ConversationRepository,
+    *,
+    run_id: str,
+    operation_id: str,
+    msg_dict: dict,
+    trace_info: dict[str, Any] | None,
+) -> Any | None:
+    """用终态 State 补全同一稳定来源键的 Model 审计消息。"""
+    message = await ModelMessageAuditRepository(conv_repo.db).get(
+        run_id=run_id,
+        operation_id=operation_id,
+    )
+    if message is None:
+        return None
+
+    content, tool_calls_data = _ai_message_content_and_tool_calls(msg_dict)
+    metadata = {**dict(message.extra_metadata or {}), **dict(msg_dict)}
+    if trace_info:
+        metadata.update(trace_info)
+    metadata["state_reconciled"] = True
+    message.content = content
+    message.extra_metadata = metadata
+    if message.execution_status == "running":
+        message.execution_status = "completed"
+        message.finished_at = utc_now_naive()
+        metadata["finished_by_reconcile"] = True
+    await conv_repo.db.flush()
+    if tool_calls_data:
+        await _project_ai_tool_calls(
+            conv_repo,
+            message_id=message.id,
+            tool_calls_data=tool_calls_data,
+            commit=False,
+        )
+    return message
+
+
+async def _reconcile_tool_error_from_state(
+    conv_repo: ConversationRepository,
+    *,
+    run_id: str,
+    request_id: str | None,
+    thread_id: str,
+    worker_id: str | None,
+    tool_call_id: str,
+    msg_dict: dict[str, Any],
+) -> None:
+    """用终态 State 补全等待 Run 裁决的 Tool error。"""
+    if not request_id or not worker_id:
+        raise ValueError("ToolMessage 对账需要 worker、thread 和 request 因果归属")
+    content = _tool_message_content(msg_dict.get("content"))
+    await ToolMessageAuditRepository(conv_repo.db).fail(
+        run_id=run_id,
+        request_id=request_id,
+        thread_id=thread_id,
+        worker_id=worker_id,
+        tool_call_id=tool_call_id,
+        output=_json_safe(msg_dict),
+        content=content,
+        error_message=content or "Tool 执行失败",
+        finished_at=utc_now_naive(),
+        duration_ms=None,
+        finished_sequence=None,
+    )
+
+
+def _tool_message_content(content: Any) -> str:
+    """将 ToolMessage content 转为兼容 ToolCall 的稳定文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def _should_reconcile_tool_state(audit: Any, tool_message: dict[str, Any]) -> bool:
+    """只用终态 State 补全仍等待 Run 裁决的 Tool error。"""
+    if audit.execution_status != "running":
+        return False
+    metadata = audit.extra_metadata if isinstance(audit.extra_metadata, dict) else {}
+    return metadata.get("awaiting_run_terminal") is True and tool_message.get("status") == "error"
 
 
 async def save_messages_from_langgraph_state(
@@ -640,6 +775,17 @@ async def save_messages_from_langgraph_state(
 
         messages = await _get_langgraph_messages(agent_instance, config_dict, context=context)
         existing_ids = await _get_existing_message_ids(conv_repo, thread_id)
+        current_model_audits = await ModelMessageAuditRepository(conv_repo.db).list_for_run(run_id) if run_id else []
+        current_audit_operation_ids = {message.operation_id for message in current_model_audits if message.operation_id}
+        current_tool_audits = await ToolMessageAuditRepository(conv_repo.db).list_for_run(run_id) if run_id else []
+        current_tool_audits_by_operation = {
+            message.operation_id: message for message in current_tool_audits if message.operation_id
+        }
+        current_tool_operation_ids = set(current_tool_audits_by_operation)
+        reconciled_audits: dict[str, Any] = {}
+        state_model_messages: dict[str, dict[str, Any]] = {}
+        state_tool_messages: dict[str, dict[str, Any]] = {}
+        last_state_ai_id: str | None = None
         last_ai_message = None
         for msg in messages or []:
             if hasattr(msg, "model_dump"):
@@ -660,10 +806,17 @@ async def save_messages_from_langgraph_state(
                     msg_type = "tool"
 
             msg_id = getattr(msg, "id", None) or msg_dict.get("id")
-            if msg_type == "human" or msg_id in existing_ids:
+            if msg_type == "human":
                 continue
 
             if msg_type == "ai":
+                last_state_ai_id = str(msg_id) if msg_id else None
+                if run_id and msg_id and str(msg_id) in current_audit_operation_ids:
+                    # Checkpoint 包含线程完整历史；同一来源键只对账最后一次 AIMessage。
+                    state_model_messages[str(msg_id)] = msg_dict
+                    continue
+                if current_model_audits or msg_id in existing_ids:
+                    continue
                 last_ai_message = await _save_ai_message(
                     conv_repo,
                     thread_id,
@@ -672,12 +825,55 @@ async def save_messages_from_langgraph_state(
                     run_id=run_id,
                     request_id=request_id,
                     commit=run_id is None,
+                    project_tool_calls=run_id is None,
                 )
             elif msg_type == "tool":
-                await _save_tool_message(conv_repo, msg_dict, commit=run_id is None)
+                tool_call_id = str(msg_dict.get("tool_call_id") or "")
+                if run_id and tool_call_id in current_tool_operation_ids:
+                    # Checkpoint 包含线程完整历史；同一来源键只对账最后一次 ToolMessage。
+                    state_tool_messages[tool_call_id] = msg_dict
+                elif not run_id and msg_id not in existing_ids:
+                    await _save_tool_message(conv_repo, msg_dict, commit=True)
 
         if run_id:
+            for operation_id, msg_dict in state_model_messages.items():
+                reconciled = await _reconcile_model_audit_message(
+                    conv_repo,
+                    run_id=run_id,
+                    operation_id=operation_id,
+                    msg_dict=msg_dict,
+                    trace_info=trace_info,
+                )
+                if reconciled is not None:
+                    reconciled_audits[operation_id] = reconciled
+            last_ai_message = reconciled_audits.get(last_state_ai_id or "") or last_ai_message
+            for tool_call_id, msg_dict in state_tool_messages.items():
+                audit = current_tool_audits_by_operation[tool_call_id]
+                if interrupt_run or not _should_reconcile_tool_state(audit, msg_dict):
+                    continue
+                await _reconcile_tool_error_from_state(
+                    conv_repo,
+                    run_id=run_id,
+                    request_id=request_id,
+                    thread_id=thread_id,
+                    worker_id=worker_id,
+                    tool_call_id=tool_call_id,
+                    msg_dict=msg_dict,
+                )
+            if current_model_audits and (complete_run or interrupt_run):
+                terminal_ai_message = reconciled_audits.get(last_state_ai_id or "")
+                if complete_run and terminal_ai_message is None:
+                    raise ValueError("最终 State AIMessage 无法与当前 Run 的 Model lifecycle 事实关联")
+                last_ai_message = terminal_ai_message
             if last_ai_message is not None:
+                has_tool_calls = bool((last_ai_message.extra_metadata or {}).get("tool_calls"))
+                should_publish = (
+                    last_ai_message.message_type != MODEL_AUDIT_MESSAGE_TYPE
+                    or complete_run
+                    or (interrupt_run and not has_tool_calls)
+                )
+                if should_publish:
+                    await conv_repo.publish_assistant_output(last_ai_message)
                 await run_repo.set_output_message(
                     run_id,
                     last_ai_message.id,
@@ -697,7 +893,7 @@ async def save_messages_from_langgraph_state(
                     raise ValueError(f"AgentRun 输出已写入但 {terminal_status} 终态未能在同一事务提交")
                 cancelled_descendants = await run_repo.cancel_active_execution_tree_descendants(terminal_run)
             await conv_repo.db.commit()
-            await _publish_execution_tree_cancel_signals(cancelled_descendants)
+            await publish_cancel_signals([run_id for run_id, _thread_id in cancelled_descendants])
             return terminal_status is not None
         return False
     except asyncio.CancelledError:
@@ -820,23 +1016,6 @@ def _ensure_full_msg(full_msg: AIMessage | None, accumulated_content: list[str])
     return full_msg
 
 
-def _extract_ai_message(messages: list[Any] | None) -> AIMessage | None:
-    """从消息列表中提取最后一条 AIMessage。"""
-    if not isinstance(messages, list):
-        return None
-
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            return msg
-
-        msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else {}
-        if msg_dict.get("type") == "ai":
-            content = msg_dict.get("content", "")
-            return msg if hasattr(msg, "content") else AIMessage(content=content)
-
-    return None
-
-
 async def _resolve_agent_runtime(
     *,
     db,
@@ -945,6 +1124,7 @@ async def stream_agent_chat(
     db,
     save_user_message: bool = True,
     execution_snapshot: dict | None = None,
+    on_prepared: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
     start_time = asyncio.get_event_loop().time()
 
@@ -972,18 +1152,6 @@ async def stream_agent_chat(
     image_content = input_message.image_content
     human_message = input_message.require_langchain_message()
     message_type = input_message.message_type
-    system_config = await system_options.get(db)
-    content_guard_enabled = bool(system_config["enable_content_guard"])
-    request_content_guard = content_guard.configured(
-        content_guard_enabled and bool(system_config["enable_content_guard_llm"]),
-        str(system_config["content_guard_llm_model"]),
-    )
-
-    if content_guard_enabled and await request_content_guard.check(query):
-        yield make_chunk(
-            status="error", error_type="content_guard_blocked", error_message="输入内容包含敏感词", meta=meta
-        )
-        return
 
     try:
         agent_item, agent, agent_config, conversation = await _resolve_agent_runtime(
@@ -1055,6 +1223,7 @@ async def stream_agent_chat(
             message_type=message_type,
             meta=meta,
         )
+        await _persist_agent_run_langfuse_trace(db=db, meta=meta, run_context=langfuse_run)
 
         attachment_conversation = conversation
         if meta.get("run_type") == "subagent":
@@ -1109,16 +1278,13 @@ async def stream_agent_chat(
 
         # 智能体流式执行期间不访问业务数据库，先结束预处理事务并归还连接池。
         await db.commit()
-        await _ensure_persistent_sandbox(
-            runtime_scope_id=runtime_scope_id,
-            uid=uid,
-            workdir_path=workdir_path,
-        )
 
         # 先构建 langgraph_config
         langgraph_config = {"configurable": {"thread_id": thread_id, "uid": uid}}
 
         protocol_message_ids: dict[tuple[str, str], str] = {}
+        model_audit = _build_model_message_audit_collector(meta, thread_id)
+        tool_audit = _build_tool_message_audit_collector(model_audit)
         async for mode, payload in _stream_agent_events(
             agent,
             messages,
@@ -1126,6 +1292,7 @@ async def stream_agent_chat(
             callbacks=langfuse_run.callbacks,
             metadata=langfuse_run.metadata,
             tags=langfuse_run.tags,
+            on_prepared=on_prepared,
         ):
             if mode == "values":
                 agent_state = extract_agent_state(
@@ -1145,12 +1312,21 @@ async def stream_agent_chat(
                 continue
 
             if mode == "stream_event":
+                event_payload = payload if isinstance(payload, dict) else {}
+                event_namespace = event_payload.get("namespace") or []
+                event_thread_id = event_payload.get("thread_id")
+                if (
+                    tool_audit is not None
+                    and event_payload.get("method") == "tools"
+                    and _is_root_tool_audit_event(event_payload, thread_id)
+                ):
+                    await tool_audit.consume(event_payload)
                 yield make_chunk(
                     status="stream_event",
-                    event=payload,
-                    namespace=payload.get("namespace") if isinstance(payload, dict) else [],
+                    event=event_payload,
+                    namespace=event_namespace,
                     meta=meta,
-                    thread_id=payload.get("thread_id") if isinstance(payload, dict) else None,
+                    thread_id=event_thread_id,
                 )
                 continue
 
@@ -1161,6 +1337,8 @@ async def stream_agent_chat(
                 continue
 
             is_subagent_chunk = bool(chunk_thread_id and chunk_thread_id != thread_id)
+            if model_audit is not None and not is_subagent_chunk:
+                await model_audit.consume(msg, metadata)
             stream_events = _message_payload_yuxi_events(
                 msg,
                 metadata=metadata,
@@ -1174,28 +1352,6 @@ async def stream_agent_chat(
                 if not is_subagent_chunk and content:
                     trace_info = get_trace_info(langfuse_run)
                     accumulated_content.append(content)
-                    content_for_check = "".join(accumulated_content[-10:])
-                    if content_guard_enabled and await request_content_guard.check_with_keywords(content_for_check):
-                        full_msg = AIMessage(content="".join(accumulated_content))
-                        await save_partial_message(
-                            conv_repo,
-                            thread_id,
-                            full_msg,
-                            "content_guard_blocked",
-                            trace_info=trace_info,
-                            run_id=meta.get("run_id"),
-                            request_id=meta.get("request_id"),
-                            worker_id=meta.get("worker_id"),
-                            interrupt_run=True,
-                        )
-                        meta["time_cost"] = asyncio.get_event_loop().time() - start_time
-                        yield make_chunk(
-                            status="interrupted",
-                            message="检测到敏感内容，已中断输出",
-                            meta=meta,
-                            terminal_committed=True,
-                        )
-                        return
 
                 yield make_chunk(
                     content=content,
@@ -1207,31 +1363,6 @@ async def stream_agent_chat(
 
         full_msg = _ensure_full_msg(full_msg, accumulated_content)
         trace_info = get_trace_info(langfuse_run)
-
-        if (
-            content_guard_enabled
-            and hasattr(full_msg, "content")
-            and await request_content_guard.check(full_msg.content)
-        ):
-            await save_partial_message(
-                conv_repo,
-                thread_id,
-                full_msg,
-                "content_guard_blocked",
-                trace_info=trace_info,
-                run_id=meta.get("run_id"),
-                request_id=meta.get("request_id"),
-                worker_id=meta.get("worker_id"),
-                interrupt_run=True,
-            )
-            meta["time_cost"] = asyncio.get_event_loop().time() - start_time
-            yield make_chunk(
-                status="interrupted",
-                message="检测到敏感内容，已中断输出",
-                meta=meta,
-                terminal_committed=True,
-            )
-            return
 
         interrupted = False
         interrupt_error_type = None
@@ -1330,6 +1461,7 @@ async def stream_agent_resume(
     current_user,
     db,
     execution_snapshot: dict | None = None,
+    on_prepared: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
     start_time = asyncio.get_event_loop().time()
 
@@ -1372,11 +1504,6 @@ async def stream_agent_resume(
     meta["runtime_scope_id"] = runtime_scope_id
     meta["workdir_relative_path"] = workdir_path
     meta["workdir_path"] = runtime_workdir_path(workdir_path)
-    await _ensure_persistent_sandbox(
-        runtime_scope_id=runtime_scope_id,
-        uid=uid,
-        workdir_path=workdir_path,
-    )
     input_context = await build_agent_input_context(
         _runtime_agent_config(agent_config, execution_snapshot),
         thread_id=thread_id,
@@ -1403,6 +1530,7 @@ async def stream_agent_resume(
         message_type="resume",
         meta=meta,
     )
+    await _persist_agent_run_langfuse_trace(db=db, meta=meta, run_context=langfuse_run)
     trace_info: dict[str, Any] = {}
     last_agent_state_signature = ""
 
@@ -1412,9 +1540,12 @@ async def stream_agent_resume(
         callbacks=langfuse_run.callbacks,
         metadata=langfuse_run.metadata,
         tags=langfuse_run.tags,
+        on_prepared=on_prepared,
     )
 
     protocol_message_ids: dict[tuple[str, str], str] = {}
+    model_audit = _build_model_message_audit_collector(meta, thread_id)
+    tool_audit = _build_tool_message_audit_collector(model_audit)
 
     try:
         async for mode, payload in stream_source:
@@ -1431,12 +1562,20 @@ async def stream_agent_resume(
 
             if mode == "stream_event":
                 event_payload = payload if isinstance(payload, dict) else {}
+                event_namespace = event_payload.get("namespace") or []
+                event_thread_id = event_payload.get("thread_id")
+                if (
+                    tool_audit is not None
+                    and event_payload.get("method") == "tools"
+                    and _is_root_tool_audit_event(event_payload, thread_id)
+                ):
+                    await tool_audit.consume(event_payload)
                 yield make_resume_chunk(
                     status="stream_event",
                     event=event_payload,
-                    namespace=event_payload.get("namespace") or [],
+                    namespace=event_namespace,
                     meta=meta,
-                    thread_id=event_payload.get("thread_id"),
+                    thread_id=event_thread_id,
                 )
                 continue
 
@@ -1458,6 +1597,8 @@ async def stream_agent_resume(
 
             if chunk_thread_id == thread_id:
                 trace_info = get_trace_info(langfuse_run)
+                if model_audit is not None:
+                    await model_audit.consume(msg, metadata)
 
             stream_events = _message_payload_yuxi_events(
                 msg,
@@ -1637,17 +1778,18 @@ async def get_agent_state_view(
             uid=current_uid,
             db=db,
         )
+        runtime_workdir = runtime_workdir_path(workdir_path)
         runtime_scope_id = str(getattr(latest_run, "runtime_scope_id", None) or thread_id)
         input_context["runtime_scope_id"] = runtime_scope_id
         input_context["workdir_relative_path"] = workdir_path
-        input_context["workdir_path"] = runtime_workdir_path(workdir_path)
+        input_context["workdir_path"] = runtime_workdir
         context = _build_agent_context(agent, input_context)
         state = await _read_checkpoint_state(agent, uid=current_uid, thread_id=thread_id, context=context)
         values = getattr(state, "values", {}) if state else {}
         response = {
             "agent_state": extract_agent_state(
                 values,
-                workdir_path=runtime_workdir_path(workdir_path),
+                workdir_path=runtime_workdir,
             )
         }
         interrupt_info = _extract_interrupt_info(state) if state else None
