@@ -107,10 +107,12 @@ async def test_get_thread_message_audits_view_serializes_model_and_tool_facts(mo
                 "created_at": "2026-08-30T01:00:00Z",
                 "started_at": "2026-08-30T01:00:01Z",
                 "prepared_at": "2026-08-30T01:00:01Z",
+                "first_model_request_at": None,
                 "first_output_at": "2026-08-30T01:00:02Z",
                 "finished_at": "2026-08-30T01:00:03Z",
                 "dispatch_latency_ms": 1000,
                 "preparation_latency_ms": 0,
+                "first_model_request_latency_ms": None,
                 "model_first_output_latency_ms": 1000,
                 "first_output_latency_ms": 2000,
                 "total_latency_ms": 3000,
@@ -136,6 +138,7 @@ async def test_get_thread_message_audits_view_serializes_model_and_tool_facts(mo
         "namespace": ["agent", "model"],
         "model_run_id": "langgraph-model-1",
         "content_blocks": [{"type": "text", "text": "模型输出"}],
+        "reasoning_content": "",
         "tool_calls": [],
     }
     tool = result["audits"][1]

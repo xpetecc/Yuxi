@@ -39,7 +39,7 @@ services:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    image: yuxi-api:${YUXI_VERSION:-0.7.2}
+    image: yuxi-api:${YUXI_VERSION:-0.7.3}
     container_name: api-prod
     working_dir: /app
     user: "1000:1000"
@@ -89,7 +89,7 @@ services:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    image: yuxi-api:${YUXI_VERSION:-0.7.2}
+    image: yuxi-api:${YUXI_VERSION:-0.7.3}
     container_name: worker-prod
     working_dir: /app
     user: "1000:1000"
@@ -114,7 +114,7 @@ services:
       POSTGRES_POOL_TIMEOUT_SECONDS: ${WORKER_POSTGRES_POOL_TIMEOUT_SECONDS:-30}
       LANGGRAPH_POSTGRES_POOL_SIZE: ${WORKER_LANGGRAPH_POSTGRES_POOL_SIZE:-120}
       LANGGRAPH_POSTGRES_POOL_TIMEOUT_SECONDS: ${WORKER_LANGGRAPH_POSTGRES_POOL_TIMEOUT_SECONDS:-30}
-    command: uv run --no-sync --no-dev arq server.worker_main.WorkerSettings
+    command: uv run --no-sync --no-dev python -m server.worker_main
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "uv run --no-sync --no-dev arq --check server.worker_main.WorkerSettings"]
@@ -138,7 +138,7 @@ services:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
-    image: yuxi-api:${YUXI_VERSION:-0.7.2}
+    image: yuxi-api:${YUXI_VERSION:-0.7.3}
     working_dir: /app
     user: "0:0"
     networks:
@@ -223,7 +223,7 @@ services:
       context: .
       dockerfile: docker/web.Dockerfile
       target: production
-    image: yuxi-web:${YUXI_VERSION:-0.7.2}
+    image: yuxi-web:${YUXI_VERSION:-0.7.3}
     container_name: web-prod
     ports:
       - "80:80"

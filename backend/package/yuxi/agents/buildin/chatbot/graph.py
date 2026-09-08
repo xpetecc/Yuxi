@@ -2,7 +2,7 @@ from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRetryMiddleware, TodoListMiddleware
 
-from yuxi.agents import BaseAgent, load_chat_model, resolve_chat_model_spec
+from yuxi.agents import BaseAgent
 from yuxi.agents.backends import (
     create_agent_composite_backend,
     create_agent_filesystem_middleware,
@@ -24,6 +24,7 @@ from yuxi.agents.middlewares.skills import SkillsMiddleware
 from yuxi.agents.middlewares.subagent_task import create_subagent_task_middleware
 from yuxi.agents.tool_approval import create_tool_approval_middleware, normalize_tool_approval_mode
 from yuxi.agents.toolkits.service import resolve_configured_runtime_tools
+from yuxi.models.chat import load_chat_model, resolve_chat_model_spec
 
 from .context import ChatBotContext
 from .prompt import TODO_MID_PROMPT, build_prompt_with_context
@@ -86,7 +87,7 @@ class ChatbotAgent(BaseAgent):
         backend = create_agent_composite_backend(context)
         model_spec = resolve_chat_model_spec(context.model)
         graph = create_agent(
-            model=load_chat_model(fully_specified_name=model_spec),
+            model=load_chat_model(fully_specified_name=model_spec, session_id=context.thread_id),
             tools=await resolve_configured_runtime_tools(context),
             system_prompt=build_prompt_with_context(context),
             middleware=await _build_middlewares(context, backend),

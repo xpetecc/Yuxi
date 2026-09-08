@@ -193,7 +193,6 @@ class TestBuildAskUserQuestionPayload:
         info = {"questions": [{"question": "测试？"}]}
         result = _build_ask_user_question_payload(info, "thread-id")
 
-        assert result["questions"][0]["question_id"] != ""
         assert len(result["questions"][0]["question_id"]) > 0
 
 
@@ -272,6 +271,7 @@ async def test_stream_agent_resume_commits_before_stream_and_routes_subagent_chu
                     {"namespace": ["task:1"], "thread_id": "child-thread"},
                 ),
             )
+            yield "checkpoint", SimpleNamespace(values={})
 
         async def get_graph(self, context=None):
             class FakeGraph:
