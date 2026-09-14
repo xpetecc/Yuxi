@@ -155,17 +155,17 @@
           <div
             ref="messageInputDockRef"
             class="bottom"
-            :class="{ 'start-screen': !conversations.length }"
+            :class="{ 'start-screen': isNewConversation }"
           >
             <div class="message-input-wrapper">
               <!-- 加载状态：加载消息 -->
-              <div v-if="isLoadingMessages" class="chat-loading">
-                <div class="loading-spinner"></div>
+              <div v-if="isLoadingMessages" class="chat-loading" role="status">
+                <div class="loading-spinner" aria-hidden="true"></div>
                 <span>正在加载消息...</span>
               </div>
 
               <!-- 打招呼区域 - 在输入框上方 -->
-              <div v-if="!conversations.length" class="chat-greeting-input">
+              <div v-if="isNewConversation" class="chat-greeting-input">
                 <h1>{{ randomGreeting }}</h1>
               </div>
 
@@ -269,6 +269,7 @@
                   >
                     <template #extra>
                       <ProjectSelectionSection
+                        upward
                         v-if="!currentChatId"
                         v-model="selectedProjectId"
                         :disabled="threadCreationInFlight"
@@ -276,6 +277,7 @@
                     </template>
                     <template #actions-left-extra>
                       <ToolApprovalModeSelector
+                        upward
                         :model-value="currentToolApprovalMode"
                         @update:model-value="handleToolApprovalModeSelect"
                       />
@@ -305,6 +307,7 @@
                       />
                       <div class="input-model-selector">
                         <ModelSelectorComponent
+                          upward
                           :model_spec="currentModelSpec"
                           size="nano"
                           display-name="mini"
@@ -858,7 +861,10 @@ import ContextUsageRing from '@/components/ContextUsageRing.vue'
 import ToolApprovalModeSelector from '@/components/ToolApprovalModeSelector.vue'
 import ModelSelectorComponent from '@/components/ModelSelectorComponent.vue'
 import AgentMessageComponent from '@/components/AgentMessageComponent.vue'
-import { formatEmptyRunStatus, isConversationSettled as isRunConversationSettled } from '@/utils/conversationProcessGrouping'
+import {
+  formatEmptyRunStatus,
+  isConversationSettled as isRunConversationSettled
+} from '@/utils/conversationProcessGrouping'
 import RefsComponent from '@/components/RefsComponent.vue'
 import ToolCallsGroupComponent from '@/components/ToolCallsGroupComponent.vue'
 import ConversationProcessGroupComponent from '@/components/ConversationProcessGroupComponent.vue'
@@ -934,6 +940,7 @@ import {
 const props = defineProps({
   agentId: { type: String, default: '' },
   initialProjectId: { type: String, default: '' },
+  isNewConversation: { type: Boolean, required: true },
   singleMode: { type: Boolean, default: true },
   sendDisabled: { type: Boolean, default: false }
 })
@@ -1926,7 +1933,9 @@ const { mentionConfig } = useAgentMentionConfig({
 
 const currentThreadMessages = computed(() => threadMessages.value[currentChatId.value] || [])
 const currentThreadRuns = computed(() => threadRuns.value[currentChatId.value] || [])
-const currentRunById = computed(() => new Map(currentThreadRuns.value.map((run) => [run.run_id, run])))
+const currentRunById = computed(
+  () => new Map(currentThreadRuns.value.map((run) => [run.run_id, run]))
+)
 const getMessageRun = (message) => currentRunById.value.get(getMessageRunId(message)) || null
 const currentThreadHasHistory = computed(() => currentThreadMessages.value.length > 0)
 const currentThreadConfigNotice = computed(() => {
@@ -2136,7 +2145,10 @@ watch(
 )
 
 const historyConversations = computed(() => {
-  return MessageProcessor.convertServerHistoryToMessages(currentThreadMessages.value, currentThreadRuns.value)
+  return MessageProcessor.convertServerHistoryToMessages(
+    currentThreadMessages.value,
+    currentThreadRuns.value
+  )
 })
 
 function mergeLocalImageFields(message, localMessage) {
@@ -2203,7 +2215,9 @@ function mergeActiveRunOngoingIntoHistory(historyConvs, ongoingMessages, activeR
     }))
     .filter((conv) => conv.messages.length > 0 || conv.run)
 
-  const activeGroupIndex = filteredHistoryConvs.findIndex((conv) => conv.run?.run_id === activeRunId)
+  const activeGroupIndex = filteredHistoryConvs.findIndex(
+    (conv) => conv.run?.run_id === activeRunId
+  )
   if (activeGroupIndex !== -1) {
     const conv = filteredHistoryConvs[activeGroupIndex]
     filteredHistoryConvs[activeGroupIndex] = {
@@ -2269,7 +2283,9 @@ const conversations = computed(() => {
 /** 间隔超过一小时时，在新用户消息上方显示发送时间。 */
 const getConversationTimeLabel = (conv, previousConv) => {
   const sentAt = conv.messages.find((message) => message.type === 'human')?.created_at
-  const finishedAt = getMessageRun(previousConv?.messages.findLast((message) => message.type === 'ai'))?.timing?.finished_at
+  const finishedAt = getMessageRun(
+    previousConv?.messages.findLast((message) => message.type === 'ai')
+  )?.timing?.finished_at
   if (!sentAt || !finishedAt) return ''
 
   // 历史消息的无时区时间来自 PostgreSQL UTC，不能按浏览器本地时间解析。
@@ -4271,17 +4287,12 @@ watch(currentChatId, (threadId, oldThreadId) => {
 }
 
 .chat-loading {
-  padding: 0 50px;
+  padding-bottom: 12px;
   text-align: center;
-  position: absolute;
-  top: 20%;
-  width: 100%;
-  z-index: 9;
-  animation: slideInUp 0.5s ease-out;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: 8px;
 
   span {
     color: var(--gray-700);

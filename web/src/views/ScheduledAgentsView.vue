@@ -764,7 +764,7 @@ defineExpose({ beforeLeave: flushAutoSave, loading, saving })
   display: grid;
   width: 100%;
   min-height: 44px;
-  padding: 6px 0;
+  padding: 10px 12px;
   border: 0;
   border-bottom: 1px solid var(--gray-100);
   background: transparent;
