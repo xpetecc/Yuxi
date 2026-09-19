@@ -108,18 +108,10 @@ class BaseAgent:
     capabilities: list[str] = []  # 智能体能力列表，如 ["file_upload", "web_search"] 等
     context_schema: type[BaseContext] = BaseContext  # 智能体上下文 schema
 
-    def __init__(self, **kwargs):
-        self.graph = None  # will be covered by get_graph
-
     @property
     def module_name(self) -> str:
         """Get the module name of the agent class."""
         return self.__class__.__module__.split(".")[-2]
-
-    @property
-    def id(self) -> str:
-        """Get the agent's class name."""
-        return self.__class__.__name__
 
     async def get_info(
         self,
@@ -146,7 +138,6 @@ class BaseAgent:
 
         # Merge metadata with class attributes, metadata takes precedence
         return {
-            "id": self.id,
             "name": getattr(self, "name", "Unknown"),
             "description": getattr(self, "description", "Unknown"),
             "metadata": metadata,
@@ -303,11 +294,6 @@ class BaseAgent:
             config=input_config,
         )
         return msg
-
-    def reload_graph(self):
-        """重置 graph 缓存，强制下次调用 get_graph 时重新构建"""
-        self.graph = None
-        logger.info(f"{self.name} graph 缓存已清空，将在下次调用时重新构建")
 
     @abstractmethod
     async def get_graph(self, **kwargs) -> CompiledStateGraph:

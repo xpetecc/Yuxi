@@ -77,9 +77,6 @@ class ChatbotAgent(BaseAgent):
     capabilities = ["file_upload", "files", "context_compression"]
     context_schema = ChatBotContext
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     async def get_graph(self, *, context, **kwargs):
         """从显式准备的 Context 构建执行图。"""
         if not getattr(context, "_runtime_prepared", False):

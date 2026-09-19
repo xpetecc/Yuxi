@@ -27,7 +27,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from yuxi.agents.buildin import agent_manager
+from yuxi.agents.buildin import AgentBackendNotFoundError, get_agent_backend
 from yuxi.agents.tool_approval import DEFAULT_TOOL_APPROVAL_MODE, normalize_tool_approval_mode
 from yuxi.config.options import system_options
 from yuxi.models.providers.cache import model_cache
@@ -669,9 +669,10 @@ async def prepare_agent_run_creation_scope(
     if not agent_item:
         raise HTTPException(status_code=404, detail="智能体不存在")
 
-    agent_backend = agent_manager.get_agent(agent_item.backend_id)
-    if not agent_backend:
-        raise HTTPException(status_code=404, detail=f"智能体后端 {agent_item.backend_id} 不存在")
+    try:
+        agent_backend = get_agent_backend(agent_item.backend_id)
+    except AgentBackendNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     run_repo = AgentRunRepository(db)
     existing = await run_repo.get_run_by_request_id(request_id)

@@ -2027,7 +2027,7 @@ def _patch_agent_run_creation(
     async def fake_get_arq_pool():
         return Queue()
 
-    monkeypatch.setattr(agent_run_service.agent_manager, "get_agent", lambda backend_id: _FakeBackend())
+    monkeypatch.setattr(agent_run_service, "get_agent_backend", lambda backend_id: _FakeBackend())
     monkeypatch.setattr(agent_run_service, "AgentRepository", AgentRepo)
     monkeypatch.setattr(agent_run_service, "ConversationRepository", ConvRepo)
     monkeypatch.setattr(agent_run_service, "AgentRunRepository", _CreateRunRepo)
