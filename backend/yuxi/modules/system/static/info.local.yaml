@@ -1,0 +1,12 @@
+# 产品品牌配置
+branding:
+  name: "通用智能体丨知识库平台"             # 产品名称（首页、登录页、侧栏共用）
+  logo: "/logo.png"                        # 产品 Logo（放在 frontend/public 目录下）
+  title: "让智能体可构建、可编排、可落地"      # 首页口号
+  login_bg: ""                             # 留空使用内置山茶折枝 SVG；填写其他图片地址则整张替换
+
+# 页脚信息
+footer:
+  copyright: "© 中科国数 2026 v{{YUXI_VERSION}}"
+  user_agreement_url: "/protocols/user-agreement.template.html"
+  privacy_policy_url: ""                   # 任一协议链接为空时不显示协议勾选项
