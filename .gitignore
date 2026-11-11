@@ -52,6 +52,7 @@ cache
 .codex
 .pytest_cache
 .zcode
+.workbuddy
 
 *.secret*
 *.nogit*
