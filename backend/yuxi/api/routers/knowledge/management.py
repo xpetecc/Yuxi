@@ -33,6 +33,7 @@ from yuxi.modules.knowledge.services.document_actions import (
     submit_document_action,
     submit_pending_document_action,
 )
+from yuxi.modules.knowledge.services.retrieval import query_with_overrides
 from yuxi.modules.knowledge.services.uploads import stage_document
 from yuxi.modules.knowledge.utils import (
     is_minio_url,
@@ -816,13 +817,13 @@ async def get_kb_image(kb_id: str, object_path: str, current_user: User = Depend
 async def query_knowledge_base(
     kb_id: str,
     query: str = Body(...),
-    meta: dict = Body(...),
+    meta: dict = Body(default_factory=dict),
     current_user: User = Depends(require_knowledge_base_read),
 ):
     """查询知识库"""
     logger.debug("Query knowledge base {}", kb_id)
     try:
-        result = await knowledge_base_manager.aquery(query, kb_id=kb_id, **meta)
+        result = await query_with_overrides(kb_id, query, meta)
         return {"result": result, "status": "success"}
     except (HTTPException, DomainError):
         raise
@@ -835,13 +836,13 @@ async def query_knowledge_base(
 async def query_test(
     kb_id: str,
     query: str = Body(...),
-    meta: dict = Body(...),
+    meta: dict = Body(default_factory=dict),
     current_user: User = Depends(require_knowledge_base_read),
 ):
     """测试查询知识库"""
     logger.debug("Query test in {}", kb_id)
     try:
-        result = await knowledge_base_manager.aquery(query, kb_id=kb_id, **meta)
+        result = await query_with_overrides(kb_id, query, meta)
         return result
     except (HTTPException, DomainError):
         raise

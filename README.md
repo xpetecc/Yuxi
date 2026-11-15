@@ -1,4 +1,4 @@
-![Yuxi：可私有部署的多租户知识智能体平台](https://oss-img.xerrors.cn/posts/2026/08/20260818-151118-mac-1787037059154-8c08f48c.png)
+![Yuxi：可私有部署的多租户知识智能体平台](https://oss-img.xerrors.cn/github/yuxi-social-preview-a4f67514.svg)
 
 **Yuxi = Cloud Agents + Knowledge RAG**，Yuxi 是一个可私有部署的多租户知识智能体平台。自定义智能体，权限可控，沉淀企业轨迹。它把知识库检索、知识图谱、LangGraph 多智能体编排、MCP/Skills、沙盒工具和权限管理放进同一个工作区。让每个用户都拥有一个云端 Codex。
 
@@ -24,6 +24,10 @@ Yuxi 是面向需要企业自部署的多用户 Agent 产品，且需要自己�
 - **连接知识图谱**：从 Milvus 知识库的文档块中抽取实体和关系，写入 Neo4j 并参与检索。
 - **管理团队使用范围**：按用户、部门和共享范围管理知识库、智能体、Skills 和模型。
 - **对比运行质量**：评估知识库的检索结果；完整智能体评估可通过公开 API 自行构建，见[智能体评估](docs/agents/agent-evaluation.md)。
+
+## 系统架构
+
+![Yuxi 系统架构图](https://oss-img.xerrors.cn/github/yuxi-architecture-20261112-f3046585a.svg)
 
 ## 快速启动
 
@@ -345,4 +349,4 @@ Yuxi 的实现和文档参考了以下优秀的开源项目：
 </a>
 
 
-[![给 Yuxi 一个 Star](https://oss-img.xerrors.cn/posts/2026/08/20260818-184409-image-da91658b.png)](https://github.com/xerrors/Yuxi)
+[![给 Yuxi 一个 Star](https://oss-img.xerrors.cn/github/yuxi-star-cta-c3ec1417.svg)](https://github.com/xerrors/Yuxi)
